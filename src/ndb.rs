@@ -168,6 +168,13 @@ impl Ndb {
         }
     }
 
+    /// Attempt to unwrap any unprocessed PNS (kind-1080) events
+    pub fn process_pns(&self, txn: &Transaction) {
+        unsafe {
+            bindings::ndb_process_pns(self.as_ptr(), txn.as_mut_ptr());
+        }
+    }
+
     /// Add a secret key to nostrdb's note ingester threads so that
     /// nostrdb can unwrap incoming giftwraps.
     pub fn add_key(&self, key: &[u8; 32]) -> bool {
