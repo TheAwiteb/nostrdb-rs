@@ -5677,6 +5677,14 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn ndb_compact(
+        ndb: *mut ndb,
+        output_path: *const ::std::os::raw::c_char,
+        own_pubkeys: *const [::std::os::raw::c_uchar; 32usize],
+        num_pubkeys: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn ndb_add_key(ndb: *mut ndb, key: *mut ::std::os::raw::c_uchar) -> ::std::os::raw::c_int;
 }
 extern "C" {

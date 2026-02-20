@@ -862,6 +862,32 @@ impl Ndb {
         Ok(results)
     }
 
+    /// Compact the database, creating a new database at `output_path`
+    /// containing only profiles and notes authored by the given pubkeys.
+    pub fn compact(&self, output_path: &str, own_pubkeys: &[[u8; 32]]) -> Result<()> {
+        let c_output = CString::new(output_path)?;
+
+        let path = Path::new(output_path);
+        if !path.exists() {
+            fs::create_dir_all(path).map_err(Error::IO)?;
+        }
+
+        let res = unsafe {
+            bindings::ndb_compact(
+                self.as_ptr(),
+                c_output.as_ptr(),
+                own_pubkeys.as_ptr() as *const [u8; 32],
+                own_pubkeys.len() as c_int,
+            )
+        };
+
+        if res == 0 {
+            return Err(Error::CompactFailed);
+        }
+
+        Ok(())
+    }
+
     /// Get the underlying pointer to the context in C
     pub fn as_ptr(&self) -> *mut bindings::ndb {
         self.refs.ndb
@@ -1411,5 +1437,116 @@ mod tests {
         }
 
         test_util::cleanup_db(&db);
+    }
+
+    #[tokio::test]
+    async fn compact_works() {
+        let db = "target/testdbs/compact";
+        let compacted_db = "target/testdbs/compact_out";
+        test_util::cleanup_db(&db);
+        test_util::cleanup_db(&compacted_db);
+
+        // secret key (for add_key) and its corresponding pubkey
+        let own_secret: [u8; 32] =
+            hex::decode("7f7ff03d123792d6ac594bfa67bf6d0c0ab55b6b1fdb6249303fe861f1ccba9a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let own_pubkey: [u8; 32] =
+            hex::decode("32bf915904bfde2d136ba45dde32c88f4aca863783999faea2e847a8fafd2f15")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        // another pubkey (not ours)
+        let other_pubkey: [u8; 32] =
+            hex::decode("e586b8d54cfecacf251c71d0b2d9b01673c8870fb3fe82a20ce5afc44ce7fccc")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        // profile pubkey (Derek Ross)
+        let profile_pubkey: [u8; 32] =
+            hex::decode("3f770d65d3a764a9c5cb503ae123e62ec7598ad035d836e2a810f3877a745b24")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        {
+            let ndb = Ndb::new(db, &Config::new()).expect("ndb");
+
+            // add our secret key (as a real app would)
+            assert!(ndb.add_key(&own_secret));
+
+            // subscribe to all events so we can wait for ingestion
+            let filter = Filter::new().kinds(vec![0, 1]).build();
+            let filters = vec![filter];
+            let sub = ndb.subscribe(&filters).expect("sub_id");
+            let waiter = ndb.wait_for_all_notes(sub, 3);
+
+            // kind 1 note from our pubkey
+            ndb.process_event(r#"["EVENT","b",{"id": "702555e52e82cc24ad517ba78c21879f6e47a7c0692b9b20df147916ae8731a3","pubkey": "32bf915904bfde2d136ba45dde32c88f4aca863783999faea2e847a8fafd2f15","created_at": 1702675561,"kind": 1,"tags": [],"content": "hello, world","sig": "2275c5f5417abfd644b7bc74f0388d70feb5d08b6f90fa18655dda5c95d013bfbc5258ea77c05b7e40e0ee51d8a2efa931dc7a0ec1db4c0a94519762c6625675"}]"#).expect("process ok");
+
+            // kind 1 note from other pubkey (should be discarded)
+            ndb.process_event(r#"["EVENT","b",{"id":"2e577580420c4ef02e8067aa842dd068be7c957f81a32b325fa1849b1650d98b","pubkey":"e586b8d54cfecacf251c71d0b2d9b01673c8870fb3fe82a20ce5afc44ce7fccc","created_at":1768414963,"kind":1,"tags":[],"content":"hi","sig":"662d45856ffc66c32df33ce5e8b7b9de14981774679b36bdb787bb8feda22b47eee7257756b915f7d54a53317151b0907a40847c635c9626debfb2a7b038c76f"}]"#).expect("process ok");
+
+            // profile event (kind 0, Derek Ross - should be kept)
+            ndb.process_event(r#"["EVENT","b",{  "id": "0b9f0e14727733e430dcb00c69b12a76a1e100f419ce369df837f7eb33e4523c",  "pubkey": "3f770d65d3a764a9c5cb503ae123e62ec7598ad035d836e2a810f3877a745b24",  "created_at": 1736785355,  "kind": 0,  "tags": [    [      "alt",      "User profile for Derek Ross"    ],    [      "i",      "twitter:derekmross",      "1634343988407726081"    ],    [      "i",      "github:derekross",      "3edaf845975fa4500496a15039323fa3I"    ]  ],  "content": "{\"about\":\"Building NostrPlebs.com and NostrNests.com. The purple pill helps the orange pill go down. Nostr is the social glue that binds all of your apps together.\",\"banner\":\"https://i.nostr.build/O2JE.jpg\",\"display_name\":\"Derek Ross\",\"lud16\":\"derekross@strike.me\",\"name\":\"Derek Ross\",\"nip05\":\"derekross@nostrplebs.com\",\"picture\":\"https://i.nostr.build/MVIJ6OOFSUzzjVEc.jpg\",\"website\":\"https://nostrplebs.com\",\"created_at\":1707238393}",  "sig": "51e1225ccaf9b6739861dc218ac29045b09d5cf3a51b0ac6ea64bd36827d2d4394244e5f58a4e4a324c84eeda060e1a27e267e0d536e5a0e45b0b6bdc2c43bbc"}]"#).expect("process ok");
+
+            waiter.await.expect("await ok");
+
+            // verify source db has all 3 notes
+            {
+                let txn = Transaction::new(&ndb).expect("txn");
+                let all = Filter::new().kinds(vec![0, 1]).build();
+                let res = ndb.query(&txn, &[all], 10).expect("query ok");
+                assert_eq!(res.len(), 3);
+            }
+
+            // compact: keep only notes from own_pubkey
+            ndb.compact(compacted_db, &[own_pubkey]).expect("compact ok");
+        }
+
+        // open compacted db and verify contents
+        {
+            let ndb = Ndb::new(compacted_db, &Config::new()).expect("open compacted");
+            let txn = Transaction::new(&ndb).expect("txn");
+
+            // our kind-1 note should be present
+            let own_filter = Filter::new()
+                .authors(vec![&own_pubkey])
+                .kinds(vec![1])
+                .build();
+            let own_notes = ndb.query(&txn, &[own_filter], 10).expect("query own");
+            assert_eq!(own_notes.len(), 1);
+            assert_eq!(
+                hex::encode(own_notes[0].note.id()),
+                "702555e52e82cc24ad517ba78c21879f6e47a7c0692b9b20df147916ae8731a3"
+            );
+
+            // other pubkey's kind-1 note should NOT be present
+            let other_filter = Filter::new()
+                .authors(vec![&other_pubkey])
+                .kinds(vec![1])
+                .build();
+            let other_notes = ndb.query(&txn, &[other_filter], 10).expect("query other");
+            assert_eq!(other_notes.len(), 0);
+
+            // profile should be present (all profiles are kept)
+            let profile_filter = Filter::new()
+                .authors(vec![&profile_pubkey])
+                .kinds(vec![0])
+                .build();
+            let profiles = ndb.query(&txn, &[profile_filter], 10).expect("query profiles");
+            assert_eq!(profiles.len(), 1);
+
+            // profile search should work
+            let search_res = ndb.search_profile(&txn, "Derek", 1);
+            assert!(search_res.is_ok());
+            assert!(search_res.unwrap().len() >= 1);
+        }
+
+        test_util::cleanup_db(&db);
+        test_util::cleanup_db(&compacted_db);
     }
 }
