@@ -712,7 +712,8 @@ impl FilterBuilder {
 
 impl Drop for Filter {
     fn drop(&mut self) {
-        debug!("dropping filter {:?}", self);
+        debug!("dropping filter {:?}\n{}", self, std::backtrace::Backtrace::force_capture());
+
         unsafe { bindings::ndb_filter_destroy(self.as_mut_ptr()) };
 
         if let Some(ptr_arc) = &self.custom_ctx {
