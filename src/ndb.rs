@@ -607,8 +607,7 @@ impl Ndb {
         sub_id: Subscription,
         num_notes: u32,
     ) -> Result<Vec<NoteKey>> {
-        let mut stream =
-            SubscriptionStream::new(self.clone(), sub_id).notes_per_await(num_notes);
+        let mut stream = SubscriptionStream::new(self.clone(), sub_id).notes_per_await(num_notes);
         let mut all_notes = Vec::new();
 
         while all_notes.len() < num_notes as usize {
@@ -1504,7 +1503,8 @@ mod tests {
             }
 
             // compact: keep only notes from own_pubkey
-            ndb.compact(compacted_db, &[own_pubkey]).expect("compact ok");
+            ndb.compact(compacted_db, &[own_pubkey])
+                .expect("compact ok");
         }
 
         // open compacted db and verify contents
@@ -1537,7 +1537,9 @@ mod tests {
                 .authors(vec![&profile_pubkey])
                 .kinds(vec![0])
                 .build();
-            let profiles = ndb.query(&txn, &[profile_filter], 10).expect("query profiles");
+            let profiles = ndb
+                .query(&txn, &[profile_filter], 10)
+                .expect("query profiles");
             assert_eq!(profiles.len(), 1);
 
             // profile search should work
