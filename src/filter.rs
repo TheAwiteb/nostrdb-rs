@@ -1,4 +1,5 @@
 use crate::{bindings, Error, FilterError, Note, Result};
+use std::cmp::Ordering;
 use std::ffi::CString;
 use std::fmt;
 use std::os::raw::c_char;
@@ -266,6 +267,23 @@ impl Filter {
 
     pub fn num_elements(&self) -> i32 {
         unsafe { &*(self.as_ptr()) }.num_elements
+    }
+
+    /// Compare two filters by their canonical query attributes as defined across
+    /// the `https://github.com/nostr-protocol/nips` NIPs.
+    ///
+    /// Equality ignores attribute order and order within set-like attributes,
+    /// but preserves multiplicity. `custom` and `relays` are ignored. Tag
+    /// values are compared by the string representation used in `REQ` filters
+    /// rather than by the internal C element type. This is canonical `REQ`
+    /// attribute equality, not equivalence of the current in-process
+    /// `matches(&Note)` behavior.
+    pub fn same_canonical_attributes(&self, other: &Filter) -> bool {
+        if same_fields_in_order(self, other) {
+            return true;
+        }
+
+        canonical_filter_fields(self) == canonical_filter_fields(other)
     }
 
     pub fn limit_mut(self, limit: u64) -> Self {
@@ -712,7 +730,11 @@ impl FilterBuilder {
 
 impl Drop for Filter {
     fn drop(&mut self) {
-        debug!("dropping filter {:?}\n{}", self, std::backtrace::Backtrace::force_capture());
+        debug!(
+            "dropping filter {:?}\n{}",
+            self,
+            std::backtrace::Backtrace::force_capture()
+        );
 
         unsafe { bindings::ndb_filter_destroy(self.as_mut_ptr()) };
 
@@ -1225,6 +1247,275 @@ pub enum FilterElement<'a> {
     Custom,
 }
 
+/// Borrowed canonical representation of one filter field.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CanonicalFilterField<'a> {
+    Ids(Vec<&'a [u8; 32]>),
+    Authors(Vec<&'a [u8; 32]>),
+    Kinds(Vec<u64>),
+    Tags(char, Vec<CanonicalTagValue<'a>>),
+    Search(&'a str),
+    Since(u64),
+    Until(u64),
+    Limit(u64),
+}
+
+/// Borrowed canonical representation of one protocol tag value.
+#[derive(Clone, Copy, Debug)]
+enum CanonicalTagValue<'a> {
+    Str(&'a str),
+    Id([u8; 32]),
+}
+
+impl PartialEq for CanonicalTagValue<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        protocol_tag_value_cmp(self, other) == Ordering::Equal
+    }
+}
+
+impl Eq for CanonicalTagValue<'_> {}
+
+impl PartialOrd for CanonicalTagValue<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CanonicalTagValue<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        protocol_tag_value_cmp(self, other)
+    }
+}
+
+/// Compare two filters exactly in stored order without allocating.
+///
+/// This is only a fast path. Canonical equality still ignores field and
+/// set-element ordering, but most callers rebuild filters in a stable order,
+/// so this lets us avoid the canonicalization work in the common case.
+fn same_fields_in_order(self_filter: &Filter, other_filter: &Filter) -> bool {
+    let mut self_fields = self_filter.into_iter();
+    let mut other_fields = other_filter.into_iter();
+
+    loop {
+        match (
+            next_canonical_field(&mut self_fields),
+            next_canonical_field(&mut other_fields),
+        ) {
+            (None, None) => return true,
+            (Some(self_field), Some(other_field)) => {
+                if !same_field_in_order(self_field, other_field) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Compare two fields exactly in stored order without allocating.
+fn same_field_in_order(self_field: FilterField<'_>, other_field: FilterField<'_>) -> bool {
+    match (self_field, other_field) {
+        (FilterField::Ids(self_ids), FilterField::Ids(other_ids)) => {
+            self_ids.into_iter().eq(other_ids)
+        }
+        (FilterField::Authors(self_authors), FilterField::Authors(other_authors)) => {
+            self_authors.into_iter().eq(other_authors)
+        }
+        (FilterField::Kinds(self_kinds), FilterField::Kinds(other_kinds)) => {
+            self_kinds.into_iter().eq(other_kinds)
+        }
+        (
+            FilterField::Tags(self_tag, self_elements),
+            FilterField::Tags(other_tag, other_elements),
+        ) => self_tag == other_tag && same_tag_values_in_order(self_elements, other_elements),
+        (FilterField::Search(self_search), FilterField::Search(other_search)) => {
+            self_search == other_search
+        }
+        (FilterField::Since(self_since), FilterField::Since(other_since)) => {
+            self_since == other_since
+        }
+        (FilterField::Until(self_until), FilterField::Until(other_until)) => {
+            self_until == other_until
+        }
+        (FilterField::Limit(self_limit), FilterField::Limit(other_limit)) => {
+            self_limit == other_limit
+        }
+        _ => false,
+    }
+}
+
+/// Canonicalize one filter for order-insensitive comparison.
+fn canonical_filter_fields(filter: &Filter) -> Vec<CanonicalFilterField<'_>> {
+    let mut fields = Vec::with_capacity(filter.num_elements() as usize);
+
+    for field in filter {
+        if let Some(field) = comparable_filter_field(field) {
+            fields.push(canonical_filter_field(field));
+        }
+    }
+
+    fields.sort_unstable();
+    fields
+}
+
+/// Canonicalize one field for order-insensitive comparison.
+fn canonical_filter_field(field: FilterField<'_>) -> CanonicalFilterField<'_> {
+    match field {
+        FilterField::Ids(ids) => {
+            let mut canonical_ids: Vec<&[u8; 32]> = ids.into_iter().collect();
+            canonical_ids.sort_unstable();
+            CanonicalFilterField::Ids(canonical_ids)
+        }
+        FilterField::Authors(authors) => {
+            let mut canonical_authors: Vec<&[u8; 32]> = authors.into_iter().collect();
+            canonical_authors.sort_unstable();
+            CanonicalFilterField::Authors(canonical_authors)
+        }
+        FilterField::Kinds(kinds) => {
+            let mut canonical_kinds: Vec<u64> = kinds.into_iter().collect();
+            canonical_kinds.sort_unstable();
+            CanonicalFilterField::Kinds(canonical_kinds)
+        }
+        FilterField::Tags(tag, elements) => {
+            let mut canonical_values = canonical_tag_values(elements);
+            canonical_values.sort_unstable();
+            CanonicalFilterField::Tags(tag, canonical_values)
+        }
+        FilterField::Search(search) => CanonicalFilterField::Search(search),
+        FilterField::Since(since) => CanonicalFilterField::Since(since),
+        FilterField::Until(until) => CanonicalFilterField::Until(until),
+        FilterField::Limit(limit) => CanonicalFilterField::Limit(limit),
+        FilterField::Relays(_) | FilterField::Custom(_) => {
+            unreachable!("non-canonical filter fields should be filtered out first")
+        }
+    }
+}
+
+fn comparable_filter_field(field: FilterField<'_>) -> Option<FilterField<'_>> {
+    match field {
+        FilterField::Relays(_) | FilterField::Custom(_) => None,
+        FilterField::Tags(tag, elements) => (elements.count() == 0
+            || has_canonical_tag_values(elements))
+        .then_some(FilterField::Tags(tag, elements)),
+        _ => Some(field),
+    }
+}
+
+/// Canonicalize the protocol tag values within one tag field.
+fn canonical_tag_values(elements: FilterElements<'_>) -> Vec<CanonicalTagValue<'_>> {
+    elements
+        .into_iter()
+        .filter_map(canonical_tag_value)
+        .collect()
+}
+
+/// Skip fields that are not part of the canonical comparison defined by the
+/// `nostr-protocol` NIPs.
+fn next_canonical_field<'a>(fields: &mut FilterIter<'a>) -> Option<FilterField<'a>> {
+    fields.by_ref().find_map(comparable_filter_field)
+}
+
+/// Whether a tag field contains any protocol tag values.
+fn has_canonical_tag_values(elements: FilterElements<'_>) -> bool {
+    elements
+        .into_iter()
+        .any(|element| canonical_tag_value(element).is_some())
+}
+
+/// Compare two tag element collections in stored order while ignoring elements
+/// that do not have a protocol tag value form.
+fn same_tag_values_in_order(
+    self_elements: FilterElements<'_>,
+    other_elements: FilterElements<'_>,
+) -> bool {
+    let mut self_elements = self_elements.into_iter();
+    let mut other_elements = other_elements.into_iter();
+
+    loop {
+        match (
+            next_canonical_tag_value(&mut self_elements),
+            next_canonical_tag_value(&mut other_elements),
+        ) {
+            (None, None) => return true,
+            (Some(self_element), Some(other_element)) => {
+                if self_element != other_element {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Skip tag elements that do not have a protocol tag value form.
+fn next_canonical_tag_value<'a>(
+    elements: &mut FilterElemIter<'a>,
+) -> Option<CanonicalTagValue<'a>> {
+    elements.by_ref().find_map(canonical_tag_value)
+}
+
+fn canonical_tag_value(element: FilterElement<'_>) -> Option<CanonicalTagValue<'_>> {
+    match element {
+        FilterElement::Str(str_value) => Some(CanonicalTagValue::Str(str_value)),
+        FilterElement::Id(id_value) => Some(CanonicalTagValue::Id(*id_value)),
+        FilterElement::Int(_) | FilterElement::Custom => None,
+    }
+}
+
+/// Compare tag values by the string representation used in `REQ` filters.
+///
+/// On wire, tag filter values are strings. `FilterElement::Str(str_value)` is
+/// compared as-is, while `FilterElement::Id(id_value)` is compared by the
+/// lowercase hex string it serializes to in `REQ` filters. This intentionally
+/// ignores the current C `elem_type` split because `same_canonical_attributes`
+/// compares canonical `REQ` attributes rather than `matches(&Note)` behavior.
+fn protocol_tag_value_cmp(
+    self_value: &CanonicalTagValue<'_>,
+    other_value: &CanonicalTagValue<'_>,
+) -> Ordering {
+    match (self_value, other_value) {
+        (CanonicalTagValue::Str(self_str), CanonicalTagValue::Str(other_str)) => {
+            self_str.cmp(other_str)
+        }
+        (CanonicalTagValue::Id(self_id), CanonicalTagValue::Id(other_id)) => self_id.cmp(other_id),
+        (CanonicalTagValue::Str(self_str), CanonicalTagValue::Id(other_id)) => {
+            cmp_str_to_lower_hex_id(self_str, other_id)
+        }
+        (CanonicalTagValue::Id(self_id), CanonicalTagValue::Str(other_str)) => {
+            cmp_str_to_lower_hex_id(other_str, self_id).reverse()
+        }
+    }
+}
+
+fn cmp_str_to_lower_hex_id(value: &str, id: &[u8; 32]) -> Ordering {
+    let value_bytes = value.as_bytes();
+    let shared_len = value_bytes.len().min(64);
+
+    for (index, value_byte) in value_bytes.iter().copied().enumerate().take(shared_len) {
+        let id_byte = id[index / 2];
+        let hex_byte = if index % 2 == 0 {
+            lower_hex_digit(id_byte >> 4)
+        } else {
+            lower_hex_digit(id_byte & 0x0f)
+        };
+
+        match value_byte.cmp(&hex_byte) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+
+    value_bytes.len().cmp(&64)
+}
+
+fn lower_hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        10..=15 => b'a' + (value - 10),
+        _ => unreachable!("hex digit out of range"),
+    }
+}
+
 impl<'a> Iterator for FilterIter<'a> {
     type Item = FilterField<'a>;
 
@@ -1555,5 +1846,216 @@ mod tests {
                 .build();
             assert!(filter.matches(&note));
         }
+    }
+
+    #[test]
+    fn same_canonical_attributes_ignores_attribute_and_element_order() {
+        let id_a: [u8; 32] = [0x11; 32];
+        let id_b: [u8; 32] = [0x22; 32];
+
+        let filter_a = Filter::new()
+            .authors([&id_a, &id_b])
+            .kinds([1, 6, 0, 3])
+            .tags(["zebra", "apple"], 't')
+            .relays(["wss://relay-a", "wss://relay-b"])
+            .limit(25)
+            .build();
+
+        let filter_b = Filter::new()
+            .limit(25)
+            .relays(["wss://relay-b", "wss://relay-a"])
+            .tags(["apple", "zebra"], 't')
+            .kinds([3, 0, 6, 1])
+            .authors([&id_b, &id_a])
+            .build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_ignores_id_order() {
+        let id_a: [u8; 32] = [0x11; 32];
+        let id_b: [u8; 32] = [0x22; 32];
+
+        let filter_a = Filter::new().ids([&id_a, &id_b]).build();
+        let filter_b = Filter::new().ids([&id_b, &id_a]).build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_preserves_id_multiplicity() {
+        let id_a: [u8; 32] = [0x11; 32];
+
+        let filter_a = Filter::new().ids([&id_a]).build();
+        let filter_b = Filter::new().ids([&id_a, &id_a]).build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_preserves_kind_multiplicity() {
+        let filter_a = Filter::new().kinds([1]).build();
+        let filter_b = Filter::new().kinds([1, 1]).build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_detects_scalar_differences() {
+        let id_a: [u8; 32] = [0x11; 32];
+
+        let filter_a = Filter::new()
+            .authors([&id_a])
+            .kinds([1])
+            .since(10)
+            .limit(25)
+            .build();
+
+        let filter_b = Filter::new()
+            .authors([&id_a])
+            .kinds([1])
+            .since(11)
+            .limit(25)
+            .build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_ignores_relays() {
+        let id_a: [u8; 32] = [0x11; 32];
+
+        let filter_a = Filter::new()
+            .authors([&id_a])
+            .relays(["wss://relay-a"])
+            .build();
+
+        let filter_b = Filter::new()
+            .authors([&id_a])
+            .relays(["wss://relay-b"])
+            .build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_compares_search() {
+        let filter_a = Filter::new().search("orange").build();
+        let filter_b = Filter::new().search("purple").build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_preserves_tag_value_multiplicity() {
+        let filter_a = Filter::new().tags(["apple"], 't').build();
+        let filter_b = Filter::new().tags(["apple", "apple"], 't').build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_normalizes_tag_values_to_protocol_form() {
+        let id_a: [u8; 32] = [0x11; 32];
+        let id_a_hex: String = hex::encode(id_a);
+
+        let filter_a = Filter::new().event(&id_a).build();
+        let filter_b = Filter::new().tags([id_a_hex.as_str()], 'e').build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_preserves_uppercase_tag_strings() {
+        let id_a: [u8; 32] = [0xab; 32];
+        let id_a_hex_lower: String = hex::encode(id_a);
+        let id_a_hex_upper: String = hex::encode(id_a).to_uppercase();
+        let json: String = format!(r##"{{"#e":["{}"]}}"##, id_a_hex_upper);
+
+        let filter_event = Filter::new().event(&id_a).build();
+        let filter_tags_lower = Filter::new().tags([id_a_hex_lower.as_str()], 'e').build();
+        let filter_tags_upper = Filter::new().tags([id_a_hex_upper.as_str()], 'e').build();
+        let filter_json_upper = Filter::from_json(&json).expect("expected json filter to parse");
+
+        assert!(filter_event.same_canonical_attributes(&filter_tags_lower));
+        assert!(filter_event.same_canonical_attributes(&filter_json_upper));
+        assert!(!filter_tags_lower.same_canonical_attributes(&filter_tags_upper));
+        assert!(!filter_event.same_canonical_attributes(&filter_tags_upper));
+        assert!(!filter_tags_upper.same_canonical_attributes(&filter_json_upper));
+    }
+
+    #[test]
+    fn same_canonical_attributes_rejects_non_64_char_hex_tag_values() {
+        let id_a: [u8; 32] = [0x11; 32];
+
+        let filter_a = Filter::new().event(&id_a).build();
+        let filter_b = Filter::new().tags(["1111"], 'e').build();
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_preserves_empty_tag_attributes() {
+        let filter_a = Filter::new().build();
+        let filter_b = Filter::new().tags(std::iter::empty::<&str>(), 'e').build();
+        let filter_c = Filter::from_json(r##"{"#e":[]}"##).expect("expected json filter to parse");
+
+        assert!(!filter_a.same_canonical_attributes(&filter_b));
+        assert!(!filter_a.same_canonical_attributes(&filter_c));
+        assert!(filter_b.same_canonical_attributes(&filter_c));
+    }
+
+    #[test]
+    fn same_canonical_attributes_matches_protocol_tag_values_from_json() {
+        let id_a: [u8; 32] = [0x11; 32];
+        let id_a_hex: String = hex::encode(id_a);
+        let json: String = format!(r##"{{"#t":["{}"]}}"##, id_a_hex);
+
+        let filter_a = Filter::from_json(&json).expect("expected json filter to parse");
+        let filter_b = Filter::new().tags([id_a_hex.as_str()], 't').build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_matches_protocol_event_tag_values_from_json() {
+        let id_a: [u8; 32] = [0x11; 32];
+        let id_a_hex: String = hex::encode(id_a);
+        let json: String = format!(r##"{{"#e":["{}"]}}"##, id_a_hex);
+
+        let filter_a = Filter::from_json(&json).expect("expected json filter to parse");
+        let filter_b = Filter::new().event(&id_a).build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_ignores_repeated_tag_attribute_order() {
+        let id_a: [u8; 32] = [0xab; 32];
+        let long_a: String = "a".repeat(65);
+
+        let filter_a = Filter::new()
+            .tags(["z"], 'e')
+            .event(&id_a)
+            .tags([long_a.as_str()], 'e')
+            .build();
+        let filter_b = Filter::new()
+            .tags([long_a.as_str()], 'e')
+            .event(&id_a)
+            .tags(["z"], 'e')
+            .build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+    }
+
+    #[test]
+    fn same_canonical_attributes_ignores_custom_filters() {
+        let filter_a = Filter::new().custom(|_| true).build();
+        let filter_b = Filter::new().custom(|_| true).build();
+        let filter_c = Filter::new().build();
+
+        assert!(filter_a.same_canonical_attributes(&filter_b));
+        assert!(filter_a.same_canonical_attributes(&filter_c));
     }
 }
