@@ -18,6 +18,12 @@ pub struct Filter {
     pub custom_ctx: Option<Arc<*mut c_void>>,
 }
 
+/// A finalized non-custom [`Filter`] that may be moved to another thread.
+#[derive(Debug)]
+pub struct SendFilter {
+    filter: Filter,
+}
+
 fn filter_fmt<'a, F>(filter: F, f: &mut fmt::Formatter<'_>) -> fmt::Result
 where
     F: IntoIterator<Item = FilterField<'a>>,
@@ -90,6 +96,21 @@ impl Clone for Filter {
         }
     }
 }
+
+impl Clone for SendFilter {
+    fn clone(&self) -> Self {
+        Self {
+            filter: Filter::copy_from(&self.filter).build(),
+        }
+    }
+}
+
+// SAFETY: `SendFilter` is only constructible from finalized filters that have
+// no custom filter callback context and no custom filter field. The inner
+// `Filter` therefore owns only nostrdb's C filter buffers. Moving that owned
+// value to another thread does not share mutable Rust closure state or borrowed
+// memory with the original thread.
+unsafe impl Send for SendFilter {}
 
 impl bindings::ndb_filter {
     fn as_ptr(&self) -> *const bindings::ndb_filter {
@@ -380,6 +401,43 @@ impl Filter {
     pub fn json(&self) -> Result<String> {
         // 1mb buffer
         self.json_with_bufsize(1024usize * 1024usize)
+    }
+}
+
+impl SendFilter {
+    fn accepts(filter: &Filter) -> bool {
+        filter.custom_ctx.is_none()
+            && !filter
+                .into_iter()
+                .any(|field| matches!(field, FilterField::Custom(_)))
+    }
+
+    /// Convert one owned filter into a sendable filter if it has no custom
+    /// filter callback state.
+    pub fn try_from_filter(filter: Filter) -> std::result::Result<Self, Filter> {
+        if !Self::accepts(&filter) {
+            return Err(filter);
+        }
+
+        Ok(Self { filter })
+    }
+
+    /// Clone one filter into a sendable filter if it has no custom filter
+    /// callback state.
+    pub fn try_clone_from_filter(filter: &Filter) -> Option<Self> {
+        Self::accepts(filter).then(|| Self {
+            filter: Filter::copy_from(filter).build(),
+        })
+    }
+
+    /// Borrow the wrapped filter.
+    pub fn as_filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// Consume the wrapper and return the wrapped filter.
+    pub fn into_filter(self) -> Filter {
+        self.filter
     }
 }
 
@@ -714,7 +772,16 @@ impl FilterBuilder {
         self
     }
 
-    pub fn build(&mut self) -> Filter {
+    /// Finalize the filter and return the built [`Filter`].
+    ///
+    /// ```compile_fail
+    /// use nostrdb::Filter;
+    ///
+    /// let mut builder = Filter::new().limit(1);
+    /// let _filter = builder.build();
+    /// let _ = builder.mut_iter();
+    /// ```
+    pub fn build(mut self) -> Filter {
         unsafe {
             bindings::ndb_filter_end(self.as_mut_ptr());
         };
@@ -909,7 +976,7 @@ impl<'a> FilterStrElements<'a> {
     }
 
     pub fn get(self, index: i32) -> Option<&'a str> {
-        assert!(self.elemtype() == FieldElemType::Id);
+        assert!(self.elemtype() == FieldElemType::Str);
 
         let ptr = unsafe {
             bindings::ndb_filter_get_string_element(self.filter.as_ptr(), self.elements, index)
@@ -2057,5 +2124,87 @@ mod tests {
 
         assert!(filter_a.same_canonical_attributes(&filter_b));
         assert!(filter_a.same_canonical_attributes(&filter_c));
+    }
+
+    #[test]
+    fn send_filter_can_cross_thread() {
+        fn assert_send<T: Send>() {}
+        fn relay_values(filter: &Filter) -> Vec<&str> {
+            filter
+                .into_iter()
+                .filter_map(|field| match field {
+                    FilterField::Relays(relays) => Some(relays.into_iter().collect()),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_default()
+        }
+
+        let id = [1; 32];
+        let author = [2; 32];
+        let filter = Filter::new()
+            .ids([&id])
+            .authors([&author])
+            .kinds([1, 7])
+            .search("needle")
+            .since(10)
+            .until(20)
+            .limit(3)
+            .relays(["wss://relay.example"])
+            .build();
+        let send_filter = SendFilter::try_clone_from_filter(&filter).expect("send filter");
+
+        assert_send::<SendFilter>();
+
+        let handle = std::thread::spawn(move || {
+            let expected = Filter::new()
+                .ids([&id])
+                .authors([&author])
+                .kinds([1, 7])
+                .search("needle")
+                .since(10)
+                .until(20)
+                .limit(3)
+                .relays(["wss://relay.example"])
+                .build();
+            send_filter.as_filter().same_canonical_attributes(&expected)
+                && relay_values(send_filter.as_filter()) == vec!["wss://relay.example"]
+        });
+
+        assert!(handle.join().expect("thread result"));
+    }
+
+    #[test]
+    fn send_filter_can_clone_empty_filter() {
+        let filter = Filter::new().build();
+        let send_filter = SendFilter::try_clone_from_filter(&filter).expect("send filter");
+
+        let handle = std::thread::spawn(move || {
+            let expected = Filter::new().build();
+            send_filter.as_filter().same_canonical_attributes(&expected)
+        });
+
+        assert!(handle.join().expect("thread result"));
+    }
+
+    #[test]
+    fn send_filter_rejects_custom_filter() {
+        let filter = Filter::new().custom(|_| true).build();
+
+        assert!(SendFilter::try_clone_from_filter(&filter).is_none());
+        assert!(SendFilter::try_from_filter(filter).is_err());
+    }
+
+    #[test]
+    fn send_filter_rejects_filter_with_custom_context() {
+        let mut builder = Filter::new();
+        builder.start_kinds_field().expect("kinds field");
+        assert!(builder.add_custom_filter_element(|_| true).is_err());
+        builder.add_int_element(1).expect("kind");
+        builder.end_field();
+        let filter = builder.build();
+
+        assert!(SendFilter::try_clone_from_filter(&filter).is_none());
+        assert!(SendFilter::try_from_filter(filter).is_err());
     }
 }
