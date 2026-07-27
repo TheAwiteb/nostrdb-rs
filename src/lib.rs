@@ -36,7 +36,7 @@ mod util;
 pub use block::{Block, BlockType, Blocks, Mention};
 pub use config::Config;
 pub use error::{Error, FilterError};
-pub use filter::{Filter, FilterBuilder, FilterElement, FilterField, MutFilterField};
+pub use filter::{Filter, FilterBuilder, FilterElement, FilterField, MutFilterField, SendFilter};
 pub(crate) use future::SubscriptionState;
 pub use future::SubscriptionStream;
 pub use ingest::IngestMetadata;
