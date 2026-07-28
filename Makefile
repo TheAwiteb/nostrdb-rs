@@ -1,5 +1,5 @@
 
 tags: fake
-	rusty-tags vi
+	find . -name '*.rs' | xargs ctags
 
 .PHONY: fake

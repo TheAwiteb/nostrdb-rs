@@ -1,0 +1,33 @@
+[package]
+name = "nostrdb_net"
+version = "0.1.0"
+# edition 2024: the absorbed relay_sync / nostrdb_relay modules use let-chains.
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde_derive = "1"
+serde = { version = "1", features = ["derive"] } # You only need this if you want app persistence
+serde_json = { workspace = true }
+nostr = { workspace = true }
+bech32 = { workspace = true }
+nostrdb = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+# NIP-77 negentropy reconcile, used by the relay_sync + nostrdb_relay modules.
+negentropy = { workspace = true }
+# relay_sync opens its own nostrdb cache under the OS data dir.
+dirs = { workspace = true }
+# Native websocket transport (crate::relay::ws). We own the socket via
+# tokio-tungstenite so relay liveness can be observed at the socket level;
+# rustls-tls-webpki-roots provides wss:// TLS with bundled roots.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+tokio = { workspace = true, features = ["sync", "rt", "net", "macros", "time"] }
+
+# reset_sigpipe restores SIG_DFL for text-emitting CLIs built on relay_sync.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
