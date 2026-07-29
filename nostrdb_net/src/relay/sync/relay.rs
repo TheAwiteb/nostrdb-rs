@@ -154,9 +154,14 @@ impl Relay {
     pub async fn sync_into(&mut self, ndb: &Ndb, filter_json: &str) -> Result<Vec<[u8; 32]>> {
         // Subscribe first so notes ingested during this REQ wake the stream we
         // await below. (A subscription only fires for future ingests, so it must
-        // exist before we feed events in.)
-        let filter = Filter::from_json(filter_json)?;
-        let sub = ndb.subscribe(std::slice::from_ref(&filter))?;
+        // exist before we feed events in.) The parsed `Filter` is dropped
+        // immediately: a `nostrdb::Filter` is `!Send`, and holding one across the
+        // await loop below would make this future `!Send`, blocking callers that
+        // drive sync on a multi-thread runtime (e.g. a `tokio::spawn`ed engine).
+        let sub = {
+            let filter = Filter::from_json(filter_json)?;
+            ndb.subscribe(std::slice::from_ref(&filter))?
+        };
 
         self.ws
             .send(Message::Text(format!(r#"["REQ","{SUB}",{filter_json}]"#)))
