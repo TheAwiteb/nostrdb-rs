@@ -14,6 +14,11 @@ nostr = { workspace = true }
 bech32 = { workspace = true }
 nostrdb = { workspace = true }
 hex = { workspace = true }
+# NIP-PNS (crate::pns): HKDF-Extract key derivation + NIP-44 v2 content,
+# base64-wrapped for the kind-1080 content field.
+base64 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }

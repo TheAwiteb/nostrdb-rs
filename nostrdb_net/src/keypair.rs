@@ -74,6 +74,18 @@ impl FullKeypair {
         FilledKeypair::new(&self.pubkey, &self.secret_key)
     }
 
+    /// Build a keypair from 32 raw secret-key bytes, deriving the x-only public
+    /// key. Returns `None` if the bytes are not a valid secp256k1 secret key
+    /// (zero or ≥ the curve order).
+    pub fn from_secret_bytes(bytes: &[u8; 32]) -> Option<Self> {
+        let secret_key = SecretKey::from_slice(bytes).ok()?;
+        let (xopk, _) = secret_key.x_only_public_key(&nostr::SECP256K1);
+        Some(FullKeypair {
+            pubkey: Pubkey::new(xopk.serialize()),
+            secret_key,
+        })
+    }
+
     pub fn generate() -> Self {
         let mut rng = nostr::secp256k1::rand::rngs::OsRng;
         let (secret_key, _) = &nostr::SECP256K1.generate_keypair(&mut rng);
