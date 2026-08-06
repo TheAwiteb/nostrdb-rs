@@ -109,6 +109,58 @@ pub async fn reconcile_sync(
     Ok(())
 }
 
+/// Pull-only reconcile of `ndb` against `relay` for a single wire filter.
+///
+/// Unlike [`reconcile_sync`] this is one-directional — it never pushes local
+/// events — and fully filter-driven: `filter_json` is the exact wire filter, so
+/// whatever `kinds`, `authors`, and `since` it carries are honoured on both the
+/// negentropy reconcile and the NIP-01 fallback. `local` is the sealed
+/// negentropy set of the matching cached events (see [`local_set`]). It fetches
+/// the ids the relay holds that the local db lacks in [`ID_FETCH_CHUNK`]-sized
+/// `REQ`s; a relay that can't reconcile falls back to a plain `REQ` pull of the
+/// same filter.
+///
+/// The returned future is `Send`, so it can be `tokio::spawn`ed onto a
+/// multi-thread runtime — the reason this primitive exists separately from
+/// [`reconcile_sync`], whose bidirectional path holds a `nostrdb::Filter`
+/// (`!Send`/`!Sync`) across its awaits. Two things keep it `Send`: it takes no
+/// `Filter` (the caller reduces the filter to `filter_json` + `local`
+/// synchronously first), and it collapses the reconcile's `!Send` `Box<dyn
+/// Error>` into a `Send` value before the next await. Because `sync_into`
+/// returns only once the received events are queryable, an `Ok(())` means the
+/// pulled history is actually readable — a deterministic settle point, not just
+/// "requested".
+pub async fn pull_reconcile(
+    relay: &mut Relay,
+    ndb: &Ndb,
+    filter_json: &str,
+    local: NegentropyStorageVector,
+) -> Result<()> {
+    // Collapse the reconcile `Result` (its `Box<dyn Error>` is `!Send`) into a
+    // `Send` `Option` before any further await. `None` means the relay can't
+    // reconcile, so fall back to a plain NIP-01 `REQ` of the same filter.
+    let need = match relay.reconcile(filter_json, local).await {
+        Ok(diff) => Some(diff.need),
+        Err(_) => None,
+    };
+    match need {
+        Some(need) => {
+            // Pull the ids the relay holds that we lack, chunked under the
+            // relay's single-`REQ` replay cap.
+            for chunk in need.chunks(ID_FETCH_CHUNK) {
+                let ids: Vec<String> = chunk.iter().map(hex::encode).collect();
+                relay
+                    .sync_into(ndb, &json!({ "ids": ids }).to_string())
+                    .await?;
+            }
+        }
+        None => {
+            relay.sync_into(ndb, filter_json).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Connect to `relay_url` and reconcile the local cache against it, returning the
 /// live relay — or `None` if nothing was reachable, in which case the CLI works
 /// offline against the cache. The relay is best-effort: it's how fresh events sync
@@ -140,7 +192,7 @@ pub async fn connect_and_sync(
 
 /// The sealed negentropy set of the cached events matching `filter`, keyed by
 /// `(created_at, id)`. This is the local side handed to [`Relay::reconcile`].
-fn local_set(ndb: &Ndb, filter: &Filter) -> Result<NegentropyStorageVector> {
+pub fn local_set(ndb: &Ndb, filter: &Filter) -> Result<NegentropyStorageVector> {
     let txn = Transaction::new(ndb)?;
     let mut storage = NegentropyStorageVector::new();
     ndb.fold(
