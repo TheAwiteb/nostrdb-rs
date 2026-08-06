@@ -175,6 +175,14 @@ impl Ndb {
         }
     }
 
+    /// Reprocess kind-1081 SNS (shared-note-storage) envelopes that arrived
+    /// before their team root was registered with [`Ndb::add_team_root`].
+    pub fn process_sns(&self, txn: &Transaction) {
+        unsafe {
+            bindings::ndb_process_sns(self.as_ptr(), txn.as_mut_ptr());
+        }
+    }
+
     /// Verify a zap note by its ID. Returns `true` if the zap is valid.
     pub fn verify_zap(&self, txn: &Transaction, zap_note_id: &[u8; 32]) -> bool {
         unsafe {
@@ -186,6 +194,17 @@ impl Ndb {
     /// nostrdb can unwrap incoming giftwraps.
     pub fn add_key(&self, key: &[u8; 32]) -> bool {
         unsafe { bindings::ndb_add_key(self.as_ptr(), key as *const u8 as *mut u8) != 0 }
+    }
+
+    /// Register a NIP-SNS team root with nostrdb's note ingester threads so that
+    /// nostrdb can auto-unwrap incoming kind-1081 shared-note-storage envelopes.
+    ///
+    /// The team root is the team's secp256k1 secret directly; nostrdb derives
+    /// the team keypair and the NIP-44 conversation key from it internally.
+    pub fn add_team_root(&self, team_root: &[u8; 32]) -> bool {
+        unsafe {
+            bindings::ndb_add_team_root(self.as_ptr(), team_root as *const u8 as *mut u8) != 0
+        }
     }
 
     /// Count the number of notes matching `filters` within the provided transaction.
@@ -1623,5 +1642,120 @@ mod tests {
 
         test_util::cleanup_db(&db);
         test_util::cleanup_db(&compacted_db);
+    }
+
+    /// team_root = 0x11,0x00…0x00,0x22, matching enostr::sns's fixed derivation
+    /// vector; nostrdb derives the team keypair + NIP-44 key from it.
+    fn sns_team_root() -> [u8; 32] {
+        let mut root = [0u8; 32];
+        root[0] = 0x11;
+        root[31] = 0x22;
+        root
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    /// A kind-1081 SNS envelope produced by enostr::sns::wrap_rumor with
+    /// team_root = sns_team_root, member secret 0x02, and inner rumor
+    /// {kind:1, content:"hello from sns"}. Wrapped in an ["EVENT",…] relay
+    /// message the way [`Ndb::process_event`] expects.
+    const SNS_ENVELOPE_JSON: &str = r#"["EVENT","b",{"id":"99b8459d77dd6873ddc4b19696a58ebffc067699e92205ddffaca57dbde7edd9","pubkey":"d6623502bcf67f6758e25080111ad9221181c33cfcba14d74dc9e3784ecfe1f7","created_at":1700000000,"kind":1081,"tags":[],"content":"ArEfCumINQm1ORoUDeVy/6whNMlLXlux87U/T9fzTTl2+RS4lT3UUb4n9SR/MxOtHcmaq8TKjZGXOgTS/zghs+5cel/cPWWIwX6gZLkFSi3XVGczhG91MPFTph67G5Q/7XJq3DvWR6vJzqF0bXLd9YphI9gs3G7Za3eVtjgcwsvv9Qj+VKmRMQAVKnlksY+qj3BH8tudCm0N6QOJpR0GKw5VKFmvnq6ErnyIM8P+6IMw61sx8KqXMpgpe/ASxC89ZHJNSuf4VPwMaj6q3xuGgfxzI7QjpOfT/L3cca8j9DYK8zbpkT6VIHdXCTYkno3UdPh9Q+9HYjL/07F5+qurLiS0Oxem53YByzgiW3HKRkk/V+j3JyXLm+jNRVXH48+QS+oOUrpBrOYMmxhxd2XIAdTZpSJJMQ2d6u60XBiLeobLuBnSSOQnpKPxGLvTCfEgxX4yFyK1K7TeS5GlnVCnnWNAUFpfpMHhaS6tjt2/gpG9qKa3PSXdh0rSHudYE7Sum6XoreulfDVD6jWW6SscVKBNCG0cDzczRSdgvQ5sDr8S5M1boDvlCQfACWmkBJURFTLOvr/taTk5U+x5+Gdk6t46GteMFITALBPL2l1JEko06ahUk3DYxGdEGesh1+WwpnWjUiYhfTTJ13tzsjxjX2RDPdktRKsPCmfyOd74ooFwq9LaDcm9dAswJkpEmHPqHYdGwsIT68tH5SDMlXygUkqZ/Kt7W2jx0+JB3N3rck/lVWG+8yWfiJsyM5VysMFcvgNdFBslW+f5vK4EVu01zvriwILpuxhKGEl9VyPHPKBlY3IqL43uzZkFQHZvhGSB9WBF8JR2A6UtTWn9jyblkZgo+fyUY0CyX82pY39msDq72i0iHTzIqwZ4nU+kAbDB9xXJQ6W4BIGHXx/l0zIAn+pp0rLHlOMvnxj1iW6UVxZcY4RJBSKsK3xfNrs9xcwDtf+v5vtk0FiHbaRqUvbHKrOfxrBWIIQxsNtLy7dZuoQy3skIeD9uYyf/aqlye+6f+CnVF4WIkYMMlOorwA2EFnnSTiEuMcoaxozDt36dW4ThprAmued7w2cyUa/+jrxO5Z4CJMBAV8Q61s5GfRLd5XxqROj43CA4g7r2sKx2uKnJsiUZvHRH9205OAe9ZpqWW0WIBYRyRvuaEGeaoIJDE+oiPUk4wD1uovx01z0PxO6UsCsFk3P/4a22y6he/NvhClI115dsjvTwf/je78mnLqI0FJ02G7b1ZR7Isx9J5JzEPUqrFT2alsLxLMDix4bWe9mIgpbRfMejshl1vkx6MpwVx538bRrq05ahXarwuMSbREPR/IwoS+mJlTNsUtJ/dHYJXuvIkN3K3cl2zQ5RtWuMBfzX9giEezUydjslJWoZY3CWtA4wFMV6KO7viGJ2dFh/2FRR5dt4VhFotdZ5EmUxjMSzsr0gBuqDJAEfJ7bdGbQ=","sig":"77b6dc3e2934d4771c76c4f6d0c76d204a2773450f541328ccccaeeae171f46d810b142708452a17d57bbfdf07c916e24d04c1378689c14ff3ab78e933dcfdef"}]"#;
+
+    /// SNS envelope arrives after the team_root is already registered: it should
+    /// auto-unwrap into the member's kind-1 rumor on ingest.
+    #[tokio::test]
+    async fn sns_unwrap_works() {
+        let db = "target/testdbs/sns_unwrap";
+        test_util::cleanup_db(&db);
+
+        let team_pub = hex32("d6623502bcf67f6758e25080111ad9221181c33cfcba14d74dc9e3784ecfe1f7");
+        let member_pub = hex32("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let envelope_id = hex32("99b8459d77dd6873ddc4b19696a58ebffc067699e92205ddffaca57dbde7edd9");
+
+        {
+            let ndb = Ndb::new(db, &Config::new()).expect("ndb");
+
+            // register the shared team_root before ingestion so it auto-unwraps
+            assert!(ndb.add_team_root(&sns_team_root()));
+
+            let filter = Filter::new().kinds(vec![1]).build();
+            let sub = ndb.subscribe(&[filter]).expect("sub_id");
+            let waiter = ndb.wait_for_all_notes(sub, 1);
+            ndb.process_event(SNS_ENVELOPE_JSON).expect("process ok");
+            waiter.await.expect("await ok");
+
+            let txn = Transaction::new(&ndb).expect("txn");
+
+            // the inner rumor was recovered
+            let inner = ndb
+                .query(&txn, &[Filter::new().kinds(vec![1]).build()], 1)
+                .expect("query ok");
+            let rumor = &inner[0].note;
+            assert!(rumor.is_rumor());
+            assert_eq!(rumor.kind(), 1);
+            assert_eq!(rumor.content(), "hello from sns");
+            // authorship survives the wrap: attributed to the member
+            assert_eq!(rumor.pubkey(), &member_pub);
+            // the "receiver" of an SNS rumor is the shared team channel
+            assert_eq!(rumor.rumor_receiver_pubkey(), Some(&team_pub));
+            assert_eq!(rumor.rumor_giftwrap_id(), Some(&envelope_id));
+
+            // the envelope itself is marked unwrapped
+            let envelope = ndb.get_note_by_id(&txn, &envelope_id).expect("envelope");
+            assert_ne!(
+                envelope.flags() & bindings::NDB_NOTE_FLAG_UNWRAPPED as u16,
+                0
+            );
+        }
+
+        test_util::cleanup_db(&db);
+    }
+
+    /// SNS envelope arrives before the team_root is registered: registering the
+    /// root and calling [`Ndb::process_sns`] should peel the stored envelope.
+    #[tokio::test]
+    async fn sns_reprocess_works() {
+        let db = "target/testdbs/sns_reprocess";
+        test_util::cleanup_db(&db);
+
+        let member_pub = hex32("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+
+        {
+            let ndb = Ndb::new(db, &Config::new()).expect("ndb");
+
+            // ingest the envelope BEFORE registering the team_root
+            let env_sub = ndb
+                .subscribe(&[Filter::new().kinds(vec![1081]).build()])
+                .expect("sub_id");
+            let env_waiter = ndb.wait_for_all_notes(env_sub, 1);
+            ndb.process_event(SNS_ENVELOPE_JSON).expect("process ok");
+            env_waiter.await.expect("await ok");
+
+            // now register the root and reprocess the stored envelope
+            let rumor_sub = ndb
+                .subscribe(&[Filter::new().kinds(vec![1]).build()])
+                .expect("sub_id");
+            let rumor_waiter = ndb.wait_for_all_notes(rumor_sub, 1);
+            assert!(ndb.add_team_root(&sns_team_root()));
+            {
+                let txn = Transaction::new(&ndb).expect("txn");
+                ndb.process_sns(&txn);
+            }
+            rumor_waiter.await.expect("await ok");
+
+            let txn = Transaction::new(&ndb).expect("txn");
+            let inner = ndb
+                .query(&txn, &[Filter::new().kinds(vec![1]).build()], 1)
+                .expect("query ok");
+            let rumor = &inner[0].note;
+            assert!(rumor.is_rumor());
+            assert_eq!(rumor.kind(), 1);
+            assert_eq!(rumor.content(), "hello from sns");
+            assert_eq!(rumor.pubkey(), &member_pub);
+        }
+
+        test_util::cleanup_db(&db);
     }
 }

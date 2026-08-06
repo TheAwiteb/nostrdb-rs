@@ -5833,6 +5833,12 @@ extern "C" {
     pub fn ndb_add_key(ndb: *mut ndb, key: *mut ::std::os::raw::c_uchar) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn ndb_add_team_root(
+        ndb: *mut ndb,
+        team_root: *mut ::std::os::raw::c_uchar,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn ndb_process_event(
         arg1: *mut ndb,
         json: *const ::std::os::raw::c_char,
@@ -5866,6 +5872,9 @@ extern "C" {
 }
 extern "C" {
     pub fn ndb_process_pns(arg1: *mut ndb, arg2: *mut ndb_txn) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn ndb_process_sns(arg1: *mut ndb, arg2: *mut ndb_txn) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn ndb_verify_zap(
