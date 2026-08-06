@@ -166,6 +166,12 @@ fn main() {
     build.compile("libnostrdb.a");
     build.define("SODIUM_STATIC", Some("1"));
 
+    // Emit nostrdb before sodium: nostrdb.a (nip44.c) references libsodium
+    // symbols like crypto_stream_chacha20_ietf_xor_ic, so with static archives
+    // and --gc-sections the referencing archive must precede the one that
+    // defines the symbol, otherwise the definition is never pulled in.
+    println!("cargo:rustc-link-lib=static=nostrdb");
+
     {
         let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
         let is_windows = target_env == "msvc";
@@ -173,8 +179,6 @@ fn main() {
 
         println!("cargo:rustc-link-lib=static={sodium_name}");
     }
-
-    println!("cargo:rustc-link-lib=static=nostrdb");
 
     // Re-run the build script if any of the C files or headers change
     for file in &["nostrdb/src/nostrdb.c", "nostrdb/src/nostrdb.h"] {
