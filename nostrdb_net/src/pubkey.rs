@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Error;
+use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 use tracing::debug;
@@ -8,12 +9,48 @@ use tracing::debug;
 #[derive(Eq, PartialEq, Clone, Copy, Hash, Ord, PartialOrd)]
 pub struct Pubkey([u8; 32]);
 
+/// A borrowed view over a 32-byte public key, mirroring [`Pubkey`] without
+/// owning its bytes. Lets callers key maps or pass pubkeys around without a
+/// copy; upgrade to an owned [`Pubkey`] with [`PubkeyRef::to_owned`].
+#[derive(Eq, PartialEq, Clone, Copy, Hash, Ord, PartialOrd)]
+pub struct PubkeyRef<'a>(&'a [u8; 32]);
+
 static HRP_NPUB: bech32::Hrp = bech32::Hrp::parse_unchecked("npub");
+
+impl Borrow<[u8; 32]> for PubkeyRef<'_> {
+    fn borrow(&self) -> &[u8; 32] {
+        self.0
+    }
+}
+
+impl<'a> PubkeyRef<'a> {
+    pub fn new(bytes: &'a [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn bytes(&self) -> &[u8; 32] {
+        self.0
+    }
+
+    pub fn to_owned(&self) -> Pubkey {
+        Pubkey::new(*self.bytes())
+    }
+
+    pub fn hex(&self) -> String {
+        hex::encode(self.bytes())
+    }
+}
 
 impl Deref for Pubkey {
     type Target = [u8; 32];
 
     fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Borrow<[u8; 32]> for Pubkey {
+    fn borrow(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -29,6 +66,11 @@ impl Pubkey {
 
     pub fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Borrow this key as a [`PubkeyRef`] without copying its bytes.
+    pub fn as_ref(&self) -> PubkeyRef<'_> {
+        PubkeyRef(self.bytes())
     }
 
     pub fn parse(s: &str) -> Result<Self, Error> {
@@ -80,6 +122,26 @@ impl Pubkey {
     pub fn to_bech(&self) -> Option<String> {
         bech32::encode::<bech32::Bech32>(HRP_NPUB, &self.0).ok()
     }
+
+    /// The `npub1…` bech32 encoding of this key. Alias of [`Pubkey::to_bech`]
+    /// under enostr's name, kept so consumers migrating off enostr don't have
+    /// to rename call sites.
+    pub fn npub(&self) -> Option<String> {
+        self.to_bech()
+    }
+
+    /// Parse a NIP-19 `nprofile1` bech32 string and extract the public key.
+    pub fn from_nprofile_bech(bech: &str) -> Option<Self> {
+        use nostr::nips::nip19::{FromBech32, Nip19Profile};
+        let nip19_profile = Nip19Profile::from_bech32(bech).ok()?;
+        Some(Pubkey::new(nip19_profile.public_key.to_bytes()))
+    }
+}
+
+impl fmt::Debug for PubkeyRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.hex())
+    }
 }
 
 impl fmt::Display for Pubkey {
@@ -120,5 +182,11 @@ impl<'de> Deserialize<'de> for Pubkey {
         let s = String::deserialize(deserializer)?;
         debug!("decoding pubkey {}", &s);
         Pubkey::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl hashbrown::Equivalent<Pubkey> for &[u8; 32] {
+    fn equivalent(&self, key: &Pubkey) -> bool {
+        self.as_slice() == key.bytes()
     }
 }

@@ -15,7 +15,7 @@ pub use keypair::{FilledKeypair, FullKeypair, Keypair, SerializableKeypair};
 pub use nostr::SecretKey;
 pub use note::{Note, NoteId};
 pub use profile::Profile;
-pub use pubkey::Pubkey;
+pub use pubkey::{Pubkey, PubkeyRef};
 pub use relay::message::{RelayEvent, RelayMessage};
 pub use relay::pool::{PoolEvent, PoolEventBuf, RelayPool};
 pub use relay::ws::{self, WsEvent, WsMessage, WsReceiver, WsSender};

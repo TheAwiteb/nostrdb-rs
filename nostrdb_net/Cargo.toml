@@ -14,6 +14,10 @@ nostr = { workspace = true }
 bech32 = { workspace = true }
 nostrdb = { workspace = true }
 hex = { workspace = true }
+# Equivalent<Pubkey> for &[u8; 32] so callers can look Pubkey-keyed maps up by
+# raw bytes without allocating a Pubkey. Kept in lockstep with the notedeck
+# workspace's hashbrown (0.15) so the trait unifies once enostr re-exports this.
+hashbrown = "0.15"
 # NIP-PNS (crate::pns): HKDF-Extract key derivation + NIP-44 v2 content,
 # base64-wrapped for the kind-1080 content field.
 base64 = { workspace = true }
