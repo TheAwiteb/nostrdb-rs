@@ -15,7 +15,7 @@ pub use filter::Filter;
 pub use keypair::{FilledKeypair, FullKeypair, Keypair, KeypairUnowned, SerializableKeypair};
 pub use nostr::SecretKey;
 pub use note::{Note, NoteId};
-pub use profile::Profile;
+pub use profile::ProfileState;
 pub use pubkey::{Pubkey, PubkeyRef};
 pub use replaceable::{query_replaceable, query_replaceable_filtered};
 pub use relay::message::{RelayEvent, RelayMessage};
