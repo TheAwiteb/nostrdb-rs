@@ -8,7 +8,7 @@ mod profile;
 mod pubkey;
 pub mod relay;
 
-pub use client::ClientMessage;
+pub use client::{ClientMessage, EventClientMessage};
 pub use error::Error;
 pub use filter::Filter;
 pub use keypair::{FilledKeypair, FullKeypair, Keypair, KeypairUnowned, SerializableKeypair};
