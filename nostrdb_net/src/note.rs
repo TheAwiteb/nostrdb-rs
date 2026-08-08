@@ -9,7 +9,7 @@ pub struct NoteId([u8; 32]);
 
 impl fmt::Debug for NoteId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.hex())
+        write!(f, "NoteId({})", self.hex())
     }
 }
 
@@ -29,12 +29,29 @@ impl NoteId {
     }
 
     pub fn from_hex(hex_str: &str) -> Result<Self, Error> {
-        let evid = NoteId(hex::decode(hex_str)?.as_slice().try_into().unwrap());
+        let evid = NoteId(hex::decode(hex_str)?.as_slice().try_into()?);
         Ok(evid)
     }
 
     pub fn to_bech(&self) -> Option<String> {
         bech32::encode::<bech32::Bech32>(HRP_NOTE, &self.0).ok()
+    }
+
+    pub fn from_bech(bech: &str) -> Option<Self> {
+        let (hrp, data) = bech32::decode(bech).ok()?;
+
+        if hrp != HRP_NOTE {
+            return None;
+        }
+
+        Some(NoteId::new(data.try_into().ok()?))
+    }
+
+    /// Parse a NIP-19 nevent1 bech32 string and extract the event ID.
+    pub fn from_nevent_bech(bech: &str) -> Option<Self> {
+        use nostr::nips::nip19::{FromBech32, Nip19Event};
+        let nip19_event = Nip19Event::from_bech32(bech).ok()?;
+        Some(NoteId::new(nip19_event.event_id.to_bytes()))
     }
 }
 
@@ -131,5 +148,11 @@ impl<'de> Deserialize<'de> for NoteId {
     {
         let s = String::deserialize(deserializer)?;
         NoteId::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl hashbrown::Equivalent<NoteId> for &[u8; 32] {
+    fn equivalent(&self, key: &NoteId) -> bool {
+        self.as_slice() == key.bytes()
     }
 }
