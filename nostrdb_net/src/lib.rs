@@ -6,6 +6,7 @@ mod note;
 pub mod pns;
 mod profile;
 mod pubkey;
+mod replaceable;
 pub mod relay;
 
 pub use client::{ClientMessage, EventClientMessage};
@@ -16,6 +17,7 @@ pub use nostr::SecretKey;
 pub use note::{Note, NoteId};
 pub use profile::Profile;
 pub use pubkey::{Pubkey, PubkeyRef};
+pub use replaceable::{query_replaceable, query_replaceable_filtered};
 pub use relay::message::{RelayEvent, RelayMessage};
 pub use relay::pool::{PoolEvent, PoolEventBuf, RelayPool};
 pub use relay::ws::{self, WsEvent, WsMessage, WsReceiver, WsSender};
