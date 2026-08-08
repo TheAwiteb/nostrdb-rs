@@ -11,7 +11,7 @@ pub mod relay;
 pub use client::ClientMessage;
 pub use error::Error;
 pub use filter::Filter;
-pub use keypair::{FilledKeypair, FullKeypair, Keypair, SerializableKeypair};
+pub use keypair::{FilledKeypair, FullKeypair, Keypair, KeypairUnowned, SerializableKeypair};
 pub use nostr::SecretKey;
 pub use note::{Note, NoteId};
 pub use profile::Profile;

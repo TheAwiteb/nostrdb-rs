@@ -40,6 +40,32 @@ impl Keypair {
     }
 }
 
+/// A borrowed view of a keypair: the pubkey and, when present, the secret key,
+/// both by reference. Lets callers pass a keypair around without cloning the
+/// secret material. Build one from a [`Keypair`] or [`FilledKeypair`] via `From`.
+pub struct KeypairUnowned<'a> {
+    pub pubkey: &'a Pubkey,
+    pub secret_key: Option<&'a SecretKey>,
+}
+
+impl<'a> From<&'a Keypair> for KeypairUnowned<'a> {
+    fn from(value: &'a Keypair) -> Self {
+        Self {
+            pubkey: &value.pubkey,
+            secret_key: value.secret_key.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a FilledKeypair<'a>> for KeypairUnowned<'a> {
+    fn from(value: &'a FilledKeypair<'a>) -> Self {
+        Self {
+            pubkey: value.pubkey,
+            secret_key: Some(value.secret_key),
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct FullKeypair {
     pub pubkey: Pubkey,
