@@ -110,12 +110,103 @@ pub fn wrap_rumor(
         .build()
 }
 
+/// Gift-wrap a kind-1082 key-share (the *outbound* half of membership) ready to
+/// publish. The `sender` shares `team_root` — which unlocks the board named by
+/// `board_addr` (`30619:<owner-hex>:<board-id>`) — with `recipient` by minting the
+/// NIP-59 nest [`parse_keyshare`] reads back: a `1082` key-share rumor, a kind-13
+/// **seal** signed by `sender`, and a kind-1059 **gift wrap** `p`-tagged to
+/// `recipient`. nostrdb auto-unwraps the gift wrap (once `recipient`'s key is
+/// registered via `ndb.add_key`) into a durable `1082` rumor.
+///
+/// This drives both membership flows: `sender == recipient` self-shares the root
+/// of a board you just created (team-of-one), and `sender != recipient` invites a
+/// member — with the *same* root, so an existing board is shared with no history
+/// re-seal. `epoch`, if given, tags the rotation generation. `created_at` stamps
+/// all three layers. Returns `None` if encryption or note construction fails.
+///
+/// Encryption mirrors [`wrap_rumor`]'s seal: NIP-44 v2 with `nip44::encrypt`,
+/// whose internal RNG supplies the nonce; the gift wrap adds a throwaway ephemeral
+/// keypair so the outer author reveals nothing about `sender`.
+pub fn wrap_keyshare(
+    sender: &FullKeypair,
+    recipient: &Pubkey,
+    team_root: &[u8; 32],
+    board_addr: &str,
+    epoch: Option<u32>,
+    created_at: u64,
+) -> Option<Note<'static>> {
+    let recipient_pk = nostrcrate_pk(recipient)?;
+
+    // Rumor (kind 1082): the share itself, signed by the sender. A 64-hex
+    // `team_root` value is stored by nostrdb as a binary id element, which is what
+    // `parse_keyshare` reads back first (see its `get_id` note).
+    let mut rumor = NoteBuilder::new()
+        .kind(KEYSHARE_KIND)
+        .content("")
+        .created_at(created_at)
+        .start_tag()
+        .tag_str("team_root")
+        .tag_str(&hex::encode(team_root))
+        .start_tag()
+        .tag_str("a")
+        .tag_str(board_addr);
+    if let Some(epoch) = epoch {
+        rumor = rumor
+            .start_tag()
+            .tag_str("epoch")
+            .tag_str(&epoch.to_string());
+    }
+    let rumor_json = rumor
+        .sign(&sender.secret_key.secret_bytes())
+        .build()?
+        .json()
+        .ok()?;
+
+    // Seal (kind 13): signed by the sender, ECDH-encrypted sender ⇄ recipient, so
+    // the recipient can attribute the share to its real author.
+    let sealed_rumor = nip44::encrypt(
+        &sender.secret_key,
+        &recipient_pk,
+        &rumor_json,
+        nip44::Version::V2,
+    )
+    .ok()?;
+    let seal_json = NoteBuilder::new()
+        .kind(SEAL_KIND as u32)
+        .content(&sealed_rumor)
+        .created_at(created_at)
+        .sign(&sender.secret_key.secret_bytes())
+        .build()?
+        .json()
+        .ok()?;
+
+    // Gift wrap (kind 1059): a throwaway ephemeral key signs and ECDH-encrypts the
+    // seal to the recipient, `p`-tagged so relays route it to their inbox.
+    let wrap_keys = FullKeypair::generate();
+    let encrypted_seal = nip44::encrypt(
+        &wrap_keys.secret_key,
+        &recipient_pk,
+        &seal_json,
+        nip44::Version::V2,
+    )
+    .ok()?;
+    NoteBuilder::new()
+        .kind(1059)
+        .content(&encrypted_seal)
+        .created_at(created_at)
+        .start_tag()
+        .tag_str("p")
+        .tag_str(&recipient.hex())
+        .sign(&wrap_keys.secret_key.secret_bytes())
+        .build()
+}
+
 /// A parsed kind-1082 key-share rumor: the shared `team_root` secret plus which
 /// board/channel it unlocks. This is the *inbound* half of membership — a member
-/// gift-wraps one of these to a new member, nostrdb auto-unwraps the `1059` to the
-/// `1082` rumor (the recipient's key is registered via `ndb.add_key`), and the app
-/// reads it here to decide whether to register the root (an app-owned accept
-/// policy — see `docs/nip-sns-sealed-shared-storage.md`).
+/// gift-wraps one of these to a new member ([`wrap_keyshare`]), nostrdb auto-unwraps
+/// the `1059` to the `1082` rumor (the recipient's key is registered via
+/// `ndb.add_key`), and the app reads it here to decide whether to register the root
+/// (an app-owned accept policy — see `docs/nip-sns-sealed-shared-storage.md`).
 pub struct KeyShare {
     /// The 32-byte shared channel secret to register with `ndb.add_team_root`.
     pub team_root: [u8; 32],
@@ -226,6 +317,32 @@ mod tests {
         let rumor_json =
             nip44::decrypt(&keys.team_keypair.secret_key, &seal.pubkey, &seal.content).ok()?;
         Some((Pubkey::new(seal.pubkey.to_bytes()), rumor_json))
+    }
+
+    /// `wrap_keyshare` produces a well-formed outer gift wrap: kind 1059, authored
+    /// by a throwaway ephemeral key (never the sharer), `p`-tagged to the recipient
+    /// so relays route it to their inbox. The inner correctness — that nostrdb
+    /// unwraps it to a `1082` carrying the right `team_root`/`a`/`epoch`, attributed
+    /// to the sharer — is verified against a real `Ndb`'s auto-unwrap in notedeck's
+    /// `teams.rs` (the app crate owns the ingest engine; we never unwrap in-process).
+    #[test]
+    fn wrap_keyshare_builds_a_routable_giftwrap() {
+        let sender = FullKeypair::generate();
+        let recipient = FullKeypair::generate();
+        let board =
+            "30619:d6623502bcf67f6758e25080111ad9221181c33cfcba14d74dc9e3784ecfe1f7:headway";
+
+        let giftwrap = wrap_keyshare(&sender, &recipient.pubkey, &test_root(), board, Some(2), 100)
+            .expect("giftwrap");
+        assert_eq!(giftwrap.kind(), 1059);
+        // Outer author is a throwaway ephemeral key, never the sharer.
+        assert_ne!(giftwrap.pubkey(), sender.pubkey.bytes());
+        // Routed to the recipient's inbox. A 64-hex `p` value is stored by nostrdb
+        // as a binary id element, so read it with `get_id`, not `get_str`.
+        assert!(giftwrap
+            .tags()
+            .into_iter()
+            .any(|t| t.get_str(0) == Some("p") && t.get_id(1) == Some(recipient.pubkey.bytes())));
     }
 
     #[test]
