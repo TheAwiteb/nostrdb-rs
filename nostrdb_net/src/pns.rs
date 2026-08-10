@@ -13,6 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use hkdf::Hkdf;
 use nostr::nips::nip44::v2::{self, ConversationKey};
+use nostrdb::{Note, NoteBuilder};
 use sha2::Sha256;
 
 use crate::FullKeypair;
@@ -57,6 +58,27 @@ pub fn derive_pns_keys(device_key: &[u8; 32]) -> PnsKeys {
 pub fn encrypt(conversation_key: &ConversationKey, inner_json: &str) -> Result<String, PnsError> {
     let payload = v2::encrypt_to_bytes(conversation_key, inner_json).map_err(PnsError::Encrypt)?;
     Ok(BASE64.encode(payload))
+}
+
+/// Wrap a signed inner-note JSON in a kind-1080 PNS envelope, signed by the
+/// derived PNS keypair (unlinkable to the account key). The wrapper's `content`
+/// is the NIP-44-encrypted `inner_json`; nostrdb transparently unwraps it on read
+/// once the device key is registered via `Ndb::add_key`, exposing the inner note
+/// by its own author/kind — only the opaque kind-1080 envelope is visible to a
+/// relay. `created_at` stamps the wrapper (the inner note keeps its own timestamp
+/// inside `inner_json`).
+///
+/// The PNS sibling of [`crate::sns::wrap_rumor`]; callers ingest/publish the
+/// returned note themselves. Returns `None` if encryption or note construction
+/// fails.
+pub fn wrap(keys: &PnsKeys, inner_json: &str, created_at: u64) -> Option<Note<'static>> {
+    let content = encrypt(&keys.conversation_key, inner_json).ok()?;
+    NoteBuilder::new()
+        .content(&content)
+        .kind(PNS_KIND)
+        .created_at(created_at)
+        .sign(&keys.keypair.secret_key.secret_bytes())
+        .build()
 }
 
 /// Decrypt a PNS event's content field back to the inner event JSON.
@@ -202,6 +224,25 @@ mod tests {
         let expected_device_pubkey =
             "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         assert_eq!(hex::encode(device_xopk.serialize()), expected_device_pubkey);
+    }
+
+    #[test]
+    fn test_wrap_produces_decryptable_kind_1080() {
+        let dk = test_device_key();
+        let keys = derive_pns_keys(&dk);
+
+        let inner = r#"{"kind":30023,"pubkey":"abc","content":"hello","tags":[],"created_at":7}"#;
+        let wrapper = wrap(&keys, inner, 1234).expect("wrap builds a note");
+
+        // The envelope is a kind-1080 note signed by the (unlinkable) PNS keypair,
+        // stamped with the passed created_at — not the inner note's.
+        assert_eq!(wrapper.kind(), PNS_KIND);
+        assert_eq!(wrapper.pubkey(), keys.keypair.pubkey.bytes());
+        assert_eq!(wrapper.created_at(), 1234);
+
+        // Its content decrypts back to the exact inner JSON with the same keys.
+        let recovered = decrypt(&keys.conversation_key, wrapper.content()).unwrap();
+        assert_eq!(recovered, inner);
     }
 
     #[test]
