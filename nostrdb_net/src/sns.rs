@@ -465,4 +465,88 @@ mod tests {
         let note = keyshare_note("not-a-key", "30619:owner:board", None);
         assert!(parse_keyshare(&note).is_none());
     }
+
+    /// Ingesting an SNS envelope whose inner rumor id already exists as a *plaintext*
+    /// note promotes that stored note to a team-sealed rumor **in place** — same
+    /// note_key/id, no duplicate — and does **not** re-notify subscriptions (the
+    /// content is unchanged). This is what lets a plaintext board be migrated to SNS
+    /// by re-sealing its existing notes; see nostrdb.c `ndb_write_note`.
+    #[tokio::test]
+    async fn promote_plaintext_note_to_sealed_rumor_in_place() {
+        use nostrdb::{Config, Filter, Ndb, Transaction};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ndb = Ndb::new(dir.path().to_str().unwrap(), &Config::new()).expect("ndb");
+
+        let member = FullKeypair::generate();
+        let keys = derive_sns_keys(&test_root()).expect("keys");
+        let team_pub = keys.team_keypair.pubkey;
+
+        // 1. Ingest a plaintext kind-1 note authored by the member.
+        let plaintext = NoteBuilder::new()
+            .kind(1)
+            .content("promote me")
+            .created_at(1700000000)
+            .sign(&member.secret_key.secret_bytes())
+            .build()
+            .expect("note");
+        let note_id = *plaintext.id();
+        let pjson = plaintext.json().expect("pjson");
+
+        let sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1]).build()])
+            .expect("sub");
+        let waiter = ndb.wait_for_all_notes(sub, 1);
+        ndb.process_event(&format!("[\"EVENT\",\"p\",{pjson}]"))
+            .expect("ingest plaintext");
+        waiter.await.expect("plaintext ingested");
+
+        // Stored as a plaintext (non-rumor) note.
+        {
+            let txn = Transaction::new(&ndb).expect("txn");
+            let n = ndb.get_note_by_id(&txn, &note_id).expect("note");
+            assert!(!n.is_rumor());
+        }
+
+        // 2. Register the team root and ingest an SNS envelope wrapping the SAME
+        //    note (same content -> same recomputed rumor id).
+        assert!(ndb.add_team_root(&test_root()));
+        let envelope = wrap_rumor(&keys, &member, &pjson, 1700000000).expect("envelope");
+        let ejson = envelope.json().expect("ejson");
+
+        // Watch kind-1 to prove the promote does NOT re-notify, and wait on the
+        // envelope's own (kind-1081) write — committed in the same writer batch as
+        // the promote — to know the promote has landed.
+        let rumor_sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1]).build()])
+            .expect("rumor sub");
+        let env_sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1081]).build()])
+            .expect("env sub");
+        let env_waiter = ndb.wait_for_all_notes(env_sub, 1);
+        ndb.process_event(&format!("[\"EVENT\",\"e\",{ejson}]"))
+            .expect("ingest envelope");
+        env_waiter.await.expect("envelope ingested");
+
+        // 3. The plaintext note was promoted in place: still exactly one kind-1
+        //    note, now a rumor sealed under the team, same id — and no re-notify.
+        let txn = Transaction::new(&ndb).expect("txn");
+        let ones = ndb
+            .query(&txn, &[Filter::new().kinds(vec![1]).build()], 10)
+            .expect("query");
+        assert_eq!(ones.len(), 1, "promote must not create a duplicate note");
+        let n = &ones[0].note;
+        assert!(n.is_rumor(), "note is now a rumor");
+        assert_eq!(n.content(), "promote me");
+        assert_eq!(n.id(), &note_id, "id preserved");
+        assert_eq!(
+            n.rumor_receiver_pubkey(),
+            Some(team_pub.bytes()),
+            "sealed under the team channel"
+        );
+        assert!(
+            ndb.poll_for_notes(rumor_sub, 10).is_empty(),
+            "promote must not notify subscriptions"
+        );
+    }
 }

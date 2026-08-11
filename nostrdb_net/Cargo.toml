@@ -40,3 +40,8 @@ tokio = { workspace = true, features = ["sync", "rt", "net", "macros", "time"] }
 # reset_sigpipe restores SIG_DFL for text-emitting CLIs built on relay_sync.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
+# SNS ingest tests stand up a real Ndb in a temp dir to exercise nostrdb's
+# auto-unwrap + the plaintext->rumor promote path end to end.
+tempfile = "3"
