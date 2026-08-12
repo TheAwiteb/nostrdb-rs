@@ -549,4 +549,142 @@ mod tests {
             "promote must not notify subscriptions"
         );
     }
+
+    /// A migrated board is many envelopes (its definition plus every card). If
+    /// they all land before the team root is registered, a single `process_sns`
+    /// catch-up — what notedeck's `register_teams` runs after `add_team_root` —
+    /// must peel *all* of them. Regression test for `ndb_process_sns` dispatching
+    /// only the first un-unwrapped envelope, which stranded migrated boards on
+    /// "Loading shared board…" (the board-def, oldest, stayed sealed) forever.
+    #[tokio::test]
+    async fn one_process_sns_call_peels_all_stored_envelopes() {
+        use nostrdb::{Config, Filter, Ndb, Transaction};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ndb = Ndb::new(dir.path().to_str().unwrap(), &Config::new()).expect("ndb");
+        let member = FullKeypair::generate();
+        let keys = derive_sns_keys(&test_root()).expect("keys");
+
+        const N: usize = 5;
+        let env_sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1081]).build()])
+            .expect("env sub");
+        let env_waiter = ndb.wait_for_all_notes(env_sub, N as u32);
+        for i in 0..N {
+            let rumor = NoteBuilder::new()
+                .kind(1)
+                .content(&format!("card {i}"))
+                .created_at(1700000000 + i as u64)
+                .sign(&member.secret_key.secret_bytes())
+                .build()
+                .expect("note");
+            let rjson = rumor.json().expect("rjson");
+            let envelope =
+                wrap_rumor(&keys, &member, &rjson, 1700000000 + i as u64).expect("envelope");
+            let ejson = envelope.json().expect("ejson");
+            ndb.process_event(&format!("[\"EVENT\",\"e{i}\",{ejson}]"))
+                .expect("ingest envelope");
+        }
+        env_waiter.await.expect("all envelopes ingested");
+
+        // Register the root (all envelopes already stored, un-unwrapped) and run a
+        // single process_sns catch-up — exactly what register_teams does.
+        assert!(ndb.add_team_root(&test_root()));
+        {
+            let txn = Transaction::new(&ndb).expect("txn");
+            ndb.process_sns(&txn);
+        }
+
+        // Reprocessing is async; poll (bounded) until every rumor peels.
+        let peeled = |ndb: &Ndb| {
+            let txn = Transaction::new(ndb).expect("txn");
+            ndb.query(&txn, &[Filter::new().kinds(vec![1]).build()], 100)
+                .expect("query")
+                .into_iter()
+                .filter(|r| r.note.is_rumor())
+                .count()
+        };
+        for _ in 0..300 {
+            if peeled(&ndb) == N {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            peeled(&ndb),
+            N,
+            "one process_sns call must peel ALL stored envelopes, not just one"
+        );
+    }
+
+    /// The same drain-all fix for `ndb_process_giftwraps`: a backlog of kind-1059
+    /// gift wraps (here several shared-board key-shares) can arrive before the
+    /// recipient's key is registered. A single `process_giftwraps` after `add_key`
+    /// must peel all of them — else only one board's key-share unwraps into a 1082
+    /// and only one board joins the roster.
+    #[tokio::test]
+    async fn one_process_giftwraps_call_peels_all_stored_wraps() {
+        use nostrdb::{Config, Filter, Ndb, Transaction};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ndb = Ndb::new(dir.path().to_str().unwrap(), &Config::new()).expect("ndb");
+        let sender = FullKeypair::generate();
+        let recipient = FullKeypair::generate();
+
+        const N: usize = 5;
+        let wrap_sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1059]).build()])
+            .expect("wrap sub");
+        let wrap_waiter = ndb.wait_for_all_notes(wrap_sub, N as u32);
+        for i in 0..N {
+            // Distinct boards → distinct key-share rumors, so each gift wrap is a
+            // separate stored note to peel.
+            let board = format!("30619:{}:board{i}", hex::encode(sender.pubkey.bytes()));
+            let giftwrap = wrap_keyshare(
+                &sender,
+                &recipient.pubkey,
+                &test_root(),
+                &board,
+                None,
+                100 + i as u64,
+            )
+            .expect("giftwrap");
+            let gjson = giftwrap.json().expect("gjson");
+            ndb.process_event(&format!("[\"EVENT\",\"g{i}\",{gjson}]"))
+                .expect("ingest giftwrap");
+        }
+        wrap_waiter.await.expect("all gift wraps ingested");
+
+        // Register the recipient key (all wraps already stored) and run a single
+        // process_giftwraps catch-up.
+        assert!(ndb.add_key(&recipient.secret_key.secret_bytes()));
+        {
+            let txn = Transaction::new(&ndb).expect("txn");
+            ndb.process_giftwraps(&txn);
+        }
+
+        let peeled = |ndb: &Ndb| {
+            let txn = Transaction::new(ndb).expect("txn");
+            ndb.query(
+                &txn,
+                &[Filter::new().kinds(vec![KEYSHARE_KIND as u64]).build()],
+                100,
+            )
+            .expect("query")
+            .into_iter()
+            .filter(|r| r.note.is_rumor())
+            .count()
+        };
+        for _ in 0..300 {
+            if peeled(&ndb) == N {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            peeled(&ndb),
+            N,
+            "one process_giftwraps call must peel ALL stored gift wraps, not just one"
+        );
+    }
 }
