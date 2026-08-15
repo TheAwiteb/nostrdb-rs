@@ -42,6 +42,9 @@ pub const KEYSHARE_KIND: u32 = 1082;
 /// Salt for deriving the envelope's NIP-44 symmetric key from `team_root`.
 const NIP44_SALT: &[u8] = b"nip44-v2";
 
+/// Salt prefix domain-separating [`derive_board_root`] from every other HKDF use.
+const BOARD_ROOT_SALT: &[u8] = b"nip-sns-board-root";
+
 /// Everything derived from a `team_root` needed to publish to and read a
 /// channel.
 pub struct SnsKeys {
@@ -68,6 +71,36 @@ pub fn derive_sns_keys(team_root: &[u8; 32]) -> Option<SnsKeys> {
         team_keypair,
         envelope_key,
     })
+}
+
+/// Derive a **deterministic** `team_root` for a board the account owns, from that
+/// account's own `secret` and a `label` (typically the board's slug).
+///
+/// Unlike a randomly minted root, every device holding the same account secret
+/// derives the *same* root for the same label. That is what an auto-created board
+/// needs: a board seeded independently on each of the account's devices at the
+/// same coordinate would, with per-device random roots, mint a *divergent* SNS
+/// channel per device (different team keypair → separate folds that never
+/// converge). A deterministic root collapses them to one channel with no
+/// cross-device coordination and no "wait for the other device's key-share" race.
+///
+/// `label` scopes the derivation so two boards under one account get isolated
+/// roots (sharing one board's key can't decrypt another). The result is always a
+/// valid secp256k1 scalar — HKDF-Extract output is out of range only with
+/// probability ~2⁻¹²⁸, and that case is rehashed away — so [`derive_sns_keys`]
+/// never rejects it. This is a *private* choice of root that no other party
+/// re-derives, so (unlike [`derive_sns_keys`]) it needs no cross-implementation
+/// byte match; only one account's own devices must agree, and they run this code.
+pub fn derive_board_root(secret: &[u8; 32], label: &str) -> [u8; 32] {
+    let salt = [BOARD_ROOT_SALT, b"/", label.as_bytes()].concat();
+    let mut candidate = hkdf_extract(secret, &salt);
+    // Rehash on the ~2⁻¹²⁸ chance the bytes aren't a valid secp256k1 secret
+    // (≥ curve order, or zero), so the derivation deterministically terminates
+    // with a root every device agrees on and derive_sns_keys accepts.
+    while FullKeypair::from_secret_bytes(&candidate).is_none() {
+        candidate = hkdf_extract(&candidate, BOARD_ROOT_SALT);
+    }
+    candidate
 }
 
 /// Wrap a rumor (the inner board action as event JSON, carrying the member's
@@ -363,6 +396,37 @@ mod tests {
 
     /// Fixed vector so the nostrdb C `ndb_ingester_add_sns_key` has a target to
     /// match. `team_root` = 0x11,0x00…0x00,0x22.
+    /// A board root is deterministic in `(secret, label)`, isolates boards by
+    /// label, differs per account, and is always a valid channel root. The
+    /// determinism is the load-bearing property: it is what lets two of an
+    /// account's devices seed the same auto-created board into one SNS channel.
+    #[test]
+    fn board_root_deterministic_scoped_and_valid() {
+        let secret = FullKeypair::generate().secret_key.secret_bytes();
+        let root = derive_board_root(&secret, "headway");
+
+        assert_eq!(
+            root,
+            derive_board_root(&secret, "headway"),
+            "same secret+label → same root (cross-device convergence)"
+        );
+        assert_ne!(
+            root,
+            derive_board_root(&secret, "work"),
+            "distinct labels → isolated per-board roots"
+        );
+        let other = FullKeypair::generate().secret_key.secret_bytes();
+        assert_ne!(
+            root,
+            derive_board_root(&other, "headway"),
+            "distinct account secrets → distinct roots"
+        );
+        assert!(
+            derive_sns_keys(&root).is_some(),
+            "a derived root is always a valid secp256k1 channel root"
+        );
+    }
+
     #[test]
     fn derive_matches_fixed_vector() {
         let keys = derive_sns_keys(&test_root()).expect("keys");
