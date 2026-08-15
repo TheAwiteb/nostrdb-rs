@@ -33,6 +33,19 @@ const SUB: &str = "sync";
 /// is only a backstop so a dropped/stuck ingest can't hang the CLI.
 const INGEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to wait for the websocket handshake in [`Relay::connect`]. The relay
+/// is normally localhost and answers in milliseconds; this only bounds a remote
+/// or tunnelled endpoint that completes the TCP connect but stalls the upgrade.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the next inbound frame in [`Relay::next_text`]. Every
+/// read in the reconcile/sync/publish path flows through `next_text`, so this one
+/// bound covers them all: a half-open relay that accepts the connection and the
+/// `NEG-OPEN` but never sends a terminating frame would otherwise block forever
+/// (a stalled stream never yields `None`, so the EOF guard never fires). The
+/// resulting error degrades gracefully via the callers' best-effort handling.
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The set difference a [`Relay::reconcile`] uncovers, as raw event ids.
 pub struct Diff {
     /// Ids the relay holds that the local cache is missing — pull these down.
@@ -84,8 +97,9 @@ pub struct Relay {
 
 impl Relay {
     pub async fn connect(url: &str) -> Result<Self> {
-        let (ws, _resp) = connect_async(url)
+        let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
             .await
+            .map_err(|_| format!("connecting to {url} timed out"))?
             .map_err(|e| format!("connecting to {url}: {e}"))?;
         Ok(Relay {
             ws,
@@ -275,12 +289,15 @@ impl Relay {
     }
 
     /// Await the next text frame, skipping pings/binary.
+    ///
+    /// Each read is bounded by [`RECV_TIMEOUT`] so a half-open relay that stops
+    /// sending mid-session can't wedge the reconcile/sync/publish loops (a stalled
+    /// stream never yields `None`, so the EOF guard below would never fire).
     async fn next_text(&mut self) -> Result<String> {
         loop {
-            let msg = self
-                .ws
-                .next()
+            let msg = tokio::time::timeout(RECV_TIMEOUT, self.ws.next())
                 .await
+                .map_err(|_| format!("{} stalled waiting for a frame", self.url))?
                 .ok_or_else(|| format!("{} closed the connection", self.url))??;
             if let Message::Text(text) = msg {
                 return Ok(text);
@@ -346,7 +363,81 @@ fn is_benign_reject(reason: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_benign_reject;
+    use super::{CONNECT_TIMEOUT, NegentropyStorageVector, RECV_TIMEOUT, Relay, is_benign_reject};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// An empty, sealed negentropy set — enough to drive [`Relay::reconcile`]'s
+    /// `NEG-OPEN` so the test can exercise the read that stalls afterwards.
+    fn empty_storage() -> NegentropyStorageVector {
+        let mut storage = NegentropyStorageVector::new();
+        storage.seal().expect("seal empty storage");
+        storage
+    }
+
+    /// Bind an ephemeral listener and accept connections, holding each open
+    /// **without ever speaking** — the socket stays alive (dropping it would send
+    /// EOF), so a client's handshake or read stalls until its own timeout fires.
+    /// `on_accept` runs per connection: raw-silent, or upgrade-then-silent.
+    async fn spawn_silent<F, Fut>(on_accept: F) -> String
+    where
+        F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(on_accept(stream));
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A never-completing hold that keeps the socket open and silent for the life
+    /// of the test.
+    async fn hold_forever<T>(_socket: T) {
+        std::future::pending::<()>().await;
+    }
+
+    /// `connect_async`'s upgrade must be bounded: an endpoint that accepts the TCP
+    /// connection but never completes the websocket handshake yields a connect
+    /// `Err` before the backstop, rather than hanging forever.
+    #[tokio::test]
+    async fn connect_times_out_on_silent_endpoint() {
+        let url = spawn_silent(hold_forever).await;
+        // Longer than CONNECT_TIMEOUT: a bounded connect returns Err before this
+        // fires; an unbounded one (a regression) trips it and fails the test.
+        let backstop = CONNECT_TIMEOUT + Duration::from_secs(5);
+        let result = tokio::time::timeout(backstop, Relay::connect(&url))
+            .await
+            .expect("connect should time out, not hang");
+        assert!(result.is_err(), "silent endpoint must yield a connect Err");
+    }
+
+    /// `next_text`'s read must be bounded: a relay that completes the websocket
+    /// upgrade and then goes silent (never answering the `NEG-OPEN`) makes
+    /// [`Relay::reconcile`] error before the backstop rather than block forever.
+    #[tokio::test]
+    async fn reconcile_times_out_on_silent_relay() {
+        let url = spawn_silent(|stream| async move {
+            if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                hold_forever(ws).await;
+            }
+        })
+        .await;
+
+        let mut relay = Relay::connect(&url).await.expect("websocket upgrade");
+        // Longer than RECV_TIMEOUT for the same reason as the connect backstop.
+        let backstop = RECV_TIMEOUT + Duration::from_secs(5);
+        let result = tokio::time::timeout(
+            backstop,
+            relay.reconcile(r#"{"kinds":[1]}"#, empty_storage()),
+        )
+        .await
+        .expect("reconcile should time out, not hang");
+        assert!(result.is_err(), "silent relay must yield a reconcile Err");
+    }
 
     #[test]
     fn classifies_ok_reasons() {
