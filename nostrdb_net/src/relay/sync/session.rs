@@ -35,8 +35,8 @@
 //!   custom predicate can't be a `SendFilter`, but such predicates are local-only
 //!   and meaningless on the wire, so dropping them for a remote subscription is
 //!   correct.)
-//! - The backfill leg reduces each filter to its wire JSON + sealed local set
-//!   synchronously, then hands both to the `Send` [`pull_reconcile`](super::pull_reconcile),
+//! - The backfill leg reduces each filter to its wire JSON synchronously, then
+//!   hands it to the `Send` [`pull_reconcile_windowed`](super::pull_reconcile_windowed),
 //!   whose future stays `Send` precisely because it takes no `Filter`.
 
 use std::collections::HashMap;
@@ -48,11 +48,22 @@ use nostrdb::{Filter, Ndb, SendFilter};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::interval;
 
-use super::{Relay, local_set, pull_reconcile};
+use super::{Relay, pull_reconcile_windowed};
 use crate::{ClientMessage, RelayPool, RelayStatus, WsEvent, WsMessage};
 
 /// How often the loop pings/reconnects relays to keep the pool alive.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Upper bound for a history backfill's initial `created_at` window: `u32::MAX`
+/// (unix second `4294967295` ≈ year 2106).
+///
+/// Far past any real event time — so windowing covers events even when their
+/// `created_at` runs ahead of this device's clock (the observed case for
+/// freshly-authored envelopes) — yet still within the 32-bit range nostrdb's
+/// filter `since`/`until` accept (a larger value fails `Filter::from_json` with
+/// `BufferOverflow`). Windows over the relay's per-sync cap hone in by bisection,
+/// so an over-wide upper bound costs only a few cheap empty-range reconciles.
+const BACKFILL_UNTIL: u64 = u32::MAX as u64;
 
 /// A handle onto a long-lived client sync loop.
 ///
@@ -386,13 +397,14 @@ fn relay_connected(pool: &RelayPool, url: &str) -> bool {
         .any(|r| r.relay.url == url && matches!(r.relay.status, RelayStatus::Connected))
 }
 
-/// Pull bounded history for a subscription from `url` using NIP-77 negentropy.
+/// Pull history for a subscription from `url` using NIP-77 negentropy.
 ///
-/// Opens a dedicated reconcile connection (separate from the live pool), and for
-/// each history filter reconciles the local set against the relay, then fetches
-/// the ids the relay holds that the local db lacks. If the relay can't reconcile,
-/// falls back to a plain `REQ` pull of the filter. See the [module docs](self) for
-/// why this reduces each filter synchronously before awaiting.
+/// Opens a dedicated reconcile connection (separate from the live pool) and, for
+/// each history filter, reconciles the relay against the local db and fetches the
+/// ids the relay holds that we lack — via [`pull_reconcile_windowed`], so a filter
+/// matching more events than the relay's per-sync cap still syncs (it bisects the
+/// `created_at` range under the cap). See the [module docs](self) for why each
+/// filter is reduced to its wire JSON synchronously before awaiting.
 async fn backfill(ndb: Ndb, url: String, filters: Vec<SendFilter>) {
     let mut relay = match Relay::connect(&url).await {
         Ok(relay) => relay,
@@ -402,24 +414,18 @@ async fn backfill(ndb: Ndb, url: String, filters: Vec<SendFilter>) {
         }
     };
 
-    // Consume by value: an owned `SendFilter` is `Send` and may cross the awaits
-    // below, whereas a `&SendFilter` would require `SendFilter: Sync` (it isn't).
-    // Reduce each filter to its wire JSON and sealed local set *synchronously* —
-    // the transient `nostrdb::Filter` from `as_filter()` drops at each `;`, so it
-    // never crosses an await — then hand both to `pull_reconcile`, whose future
-    // stays `Send` precisely because it takes no `Filter`.
+    // Reduce each filter to its wire JSON *synchronously* — the transient
+    // `nostrdb::Filter` from `as_filter()` drops at the `;`, so it never crosses an
+    // await — then hand the JSON to `pull_reconcile_windowed`, whose future stays
+    // `Send` precisely because it holds no `Filter` (an owned `SendFilter` would be
+    // `Send`, but a `&SendFilter` would need `SendFilter: Sync`, which it isn't).
     for filter in filters {
         let Ok(filter_json) = filter.as_filter().json() else {
             continue;
         };
-        let local = match local_set(&ndb, filter.as_filter()) {
-            Ok(local) => local,
-            Err(e) => {
-                tracing::warn!("session backfill: local set failed: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = pull_reconcile(&mut relay, &ndb, &filter_json, local).await {
+        if let Err(e) =
+            pull_reconcile_windowed(&mut relay, &ndb, &filter_json, BACKFILL_UNTIL).await
+        {
             tracing::warn!("session backfill: {url}: {e}");
         }
     }
@@ -453,6 +459,13 @@ mod tests {
     /// Spawn an in-process hermetic relay backed by `ndb` on an ephemeral port.
     fn spawn_relay(ndb: Ndb) -> RelayHandle {
         server::spawn(ndb, "127.0.0.1:0".parse().expect("addr")).expect("spawn relay")
+    }
+
+    /// Count events of `kind` currently queryable in `ndb`.
+    fn count_kind(ndb: &Ndb, kind: u64) -> usize {
+        let txn = Transaction::new(ndb).expect("txn");
+        let filter = Filter::new().kinds([kind]).build();
+        ndb.query(&txn, &[filter], 1_000_000).expect("query").len()
     }
 
     /// Build a signed note, returning its bare event JSON and 32-byte id.
@@ -570,5 +583,132 @@ mod tests {
             "B's live subscription should receive A's new event"
         );
         relay.shutdown();
+    }
+
+    /// PROBE (ignored, hits the network): run a raw NIP-77 session against the
+    /// real relay to observe how strfry's `maxSyncEvents` cap manifests — whether
+    /// it streams partial `need` ids across rounds and then `NEG-ERR`s, or refuses
+    /// up front. Prints a frame-by-frame trace. Run with:
+    ///   PROBE_RELAY=ws://relay.jb55.com cargo test -p nostrdb_net --lib \
+    ///     probe_real_relay_negentropy -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "hits the real network relay; set PROBE_RELAY"]
+    async fn probe_real_relay_negentropy() {
+        use futures_util::SinkExt;
+        use negentropy::{Negentropy, NegentropyStorageVector};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = std::env::var("PROBE_RELAY").unwrap_or_else(|_| "ws://relay.jb55.com".into());
+        let filter_json =
+            std::env::var("PROBE_FILTER").unwrap_or_else(|_| r#"{"kinds":[1080]}"#.into());
+        eprintln!("probe: {url} filter={filter_json}");
+
+        let (mut ws, _) = connect_async(&url).await.expect("connect");
+
+        // Empty local set: we hold nothing, so `need` is the relay's whole match.
+        let mut storage = NegentropyStorageVector::new();
+        storage.seal().expect("seal");
+        let mut neg = Negentropy::owned(storage, 0).expect("neg");
+        let initial = neg.initiate().expect("initiate");
+        ws.send(Message::Text(format!(
+            r#"["NEG-OPEN","probe",{filter_json},"{}"]"#,
+            hex::encode(&initial)
+        )))
+        .await
+        .expect("send NEG-OPEN");
+
+        let mut round = 0u32;
+        let mut total_need = 0usize;
+        let started = std::time::Instant::now();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
+                .await
+                .expect("frame timeout")
+                .expect("stream end")
+                .expect("ws error");
+            let Message::Text(text) = msg else { continue };
+            let frame: Vec<serde_json::Value> = serde_json::from_str(&text).expect("json");
+            match frame.first().and_then(|v| v.as_str()) {
+                Some("NEG-MSG") => {
+                    round += 1;
+                    let payload = frame.get(2).and_then(|v| v.as_str()).expect("payload");
+                    let bytes = hex::decode(payload).expect("hex");
+                    let mut have = Vec::new();
+                    let mut need = Vec::new();
+                    let reply = neg
+                        .reconcile_with_ids(&bytes, &mut have, &mut need)
+                        .expect("reconcile");
+                    total_need += need.len();
+                    eprintln!(
+                        "round {round}: +{} need (total {total_need}), +{} have, more={}, {:?} elapsed",
+                        need.len(),
+                        have.len(),
+                        reply.is_some(),
+                        started.elapsed()
+                    );
+                    match reply {
+                        Some(reply) => ws
+                            .send(Message::Text(format!(
+                                r#"["NEG-MSG","probe","{}"]"#,
+                                hex::encode(&reply)
+                            )))
+                            .await
+                            .expect("send NEG-MSG"),
+                        None => {
+                            eprintln!("CONVERGED: {total_need} need in {round} rounds");
+                            break;
+                        }
+                    }
+                }
+                Some("NEG-ERR") => {
+                    eprintln!("NEG-ERR after {round} rounds / {total_need} need: {}", text);
+                    break;
+                }
+                other => {
+                    eprintln!("other frame {other:?}: {}", &text[..text.len().min(200)]);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// E2E (ignored, hits the network): a [`Session`] backfills a filter whose
+    /// match exceeds the relay's per-sync cap into a fresh db, driven entirely
+    /// through the public API (`set_subscription` + `wait_for_sync`). Proves the
+    /// windowed backfill bisects under the cap and settles with the whole set
+    /// queryable. Run with (the default relay has tens of thousands of kind-1080
+    /// PNS envelopes behind `maxSyncEvents = 5000`):
+    ///   PROBE_RELAY=ws://relay.jb55.com cargo test -p nostrdb_net --lib \
+    ///     session_backfills_past_relay_cap -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "hits the real network relay; set PROBE_RELAY"]
+    async fn session_backfills_past_relay_cap() {
+        let url = std::env::var("PROBE_RELAY").unwrap_or_else(|_| "ws://relay.jb55.com".into());
+        let kind: u64 = std::env::var("PROBE_KIND")
+            .ok()
+            .and_then(|k| k.parse().ok())
+            .unwrap_or(1080);
+        eprintln!("e2e: {url} kind={kind}");
+
+        let (_dir, ndb) = temp_ndb();
+        let session = Session::new(ndb.clone());
+        // Same filter for live + history; the history leg is what backfills the
+        // capped set, the live leg just keeps the sub open (harmless replay).
+        let hist = Filter::new().kinds([kind]).build();
+        let live = Filter::new().kinds([kind]).build();
+        session.set_subscription("probe", url, vec![live], vec![hist]);
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(180), session.wait_for_sync())
+            .await
+            .expect("backfill should settle within 180s");
+        let n = count_kind(&ndb, kind);
+        eprintln!("settled: {n} kind-{kind} events in {:?}", started.elapsed());
+
+        assert!(
+            n > 5000,
+            "windowed backfill should sync past the relay's 5000-event cap; got {n}"
+        );
     }
 }

@@ -22,7 +22,7 @@ use negentropy::{Id, NegentropyStorageVector};
 use nostrdb::{Config, Filter, Ndb, Note, Transaction};
 use serde_json::json;
 
-pub use relay::{Diff, Relay};
+pub use relay::{Diff, Relay, TooManyResults};
 pub use session::Session;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -158,6 +158,104 @@ pub async fn pull_reconcile(
         }
         None => {
             relay.sync_into(ndb, filter_json).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Pull-only reconcile of a filter that may match more events than the relay's
+/// per-sync cap (strfry `maxSyncEvents`) allows, by bisecting its `created_at`
+/// range until every window reconciles under the cap.
+///
+/// A relay refuses a `NEG-OPEN` outright when its filter matches more than the cap
+/// — it counts the *whole* match, not the set difference, and streams no partial
+/// result (verified against strfry, which logs `QUERY size exceeded` and replies
+/// `NEG-ERR ... "too many query results"`). So a single [`pull_reconcile`] can't
+/// sync such a filter. This reconciles the full range first — one pass for any
+/// set already under the cap — and on a [`TooManyResults`] refusal splits the
+/// window in half and retries each half, recursing until each window is under the
+/// cap; every in-cap window then pulls its diff exactly as [`pull_reconcile`] does.
+///
+/// `base_filter_json` is the wire filter (its own `since`/`until`, if any, clamp
+/// the initial window; `until_now` supplies the upper bound when it carries no
+/// `until`). Windows are disjoint (`[since, mid]` and `[mid+1, until]`), so events
+/// are neither double-fetched nor skipped at a boundary. A window that stays over
+/// the cap even at one-second width (a pathological >cap events in a single
+/// second) falls back to a plain bounded `REQ` pull. A non-cap reconcile error
+/// (e.g. a relay that doesn't speak NIP-77) propagates so the caller can fall back.
+///
+/// `Send`, like [`pull_reconcile`]: it holds no `nostrdb::Filter` across an await —
+/// each window is reduced to wire JSON (`serde_json`, `Send`) plus a sealed local
+/// set synchronously (the transient `Filter` from [`Filter::from_json`] drops
+/// before the reconcile).
+pub async fn pull_reconcile_windowed(
+    relay: &mut Relay,
+    ndb: &Ndb,
+    base_filter_json: &str,
+    until_now: u64,
+) -> Result<()> {
+    let base: serde_json::Value = serde_json::from_str(base_filter_json)?;
+    // The caller's own bounds clamp the search; absent an explicit `until`, cover
+    // up to `until_now`.
+    let base_since = base
+        .get("since")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let base_until = base
+        .get("until")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(until_now);
+
+    // A LIFO stack of `created_at` windows still to reconcile.
+    let mut windows = vec![(base_since, base_until)];
+    while let Some((since, until)) = windows.pop() {
+        // Reduce this window to wire JSON + a sealed local set *synchronously*, so
+        // the transient `Filter` never crosses the reconcile await below.
+        let window_json = {
+            let mut obj = base.clone();
+            // Object-key assignment overrides any inherited since/until — no
+            // duplicate fields, unlike copying them onto a FilterBuilder.
+            obj["since"] = serde_json::json!(since);
+            obj["until"] = serde_json::json!(until);
+            obj.to_string()
+        };
+        let local = local_set(ndb, &Filter::from_json(&window_json)?)?;
+
+        // Collapse the reconcile `Result` (its `Box<dyn Error>` is `!Send`) into a
+        // `Send` value in this one statement, before any further await — holding
+        // the error across the awaits below would make this future `!Send`. `Ok`
+        // carries the ids to pull; `Err(())` flags the recoverable cap refusal; a
+        // fatal (non-cap) error propagates here and now, with no await after it.
+        let need = match relay.reconcile(&window_json, local).await {
+            Ok(diff) => Ok(diff.need),
+            Err(e) if e.downcast_ref::<TooManyResults>().is_some() => Err(()),
+            Err(e) => return Err(e),
+        };
+        match need {
+            Ok(need) => {
+                for chunk in need.chunks(ID_FETCH_CHUNK) {
+                    let ids: Vec<String> = chunk.iter().map(hex::encode).collect();
+                    relay
+                        .sync_into(ndb, &json!({ "ids": ids }).to_string())
+                        .await?;
+                }
+            }
+            Err(()) => {
+                if until <= since + 1 {
+                    // Can't bisect a one-second (or empty) window further; pull it
+                    // with a plain REQ. Bounded by the relay's REQ limit, so lossy
+                    // above it — but >cap events sharing a single second is
+                    // pathological for the envelope kinds this syncs.
+                    tracing::warn!(
+                        "windowed reconcile: window [{since},{until}] over cap at min width; REQ fallback"
+                    );
+                    relay.sync_into(ndb, &window_json).await?;
+                } else {
+                    let mid = since + (until - since) / 2;
+                    windows.push((since, mid));
+                    windows.push((mid + 1, until));
+                }
+            }
         }
     }
     Ok(())

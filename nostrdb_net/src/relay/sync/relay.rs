@@ -41,6 +41,40 @@ pub struct Diff {
     pub have: Vec<[u8; 32]>,
 }
 
+/// [`Relay::reconcile`] error: the relay refused the whole reconciliation because
+/// the filter matches more events than its per-sync cap (strfry `maxSyncEvents`,
+/// surfaced as `NEG-ERR ... "blocked: too many query results"`).
+///
+/// The relay counts the filter's *total* match, not the set difference, and
+/// streams no partial result — so a single reconcile can't sync such a filter.
+/// This is distinct from a fatal error precisely because it is *recoverable* by
+/// narrowing the filter so each sub-query stays under the cap; see
+/// [`pull_reconcile_windowed`](super::pull_reconcile_windowed), which bisects the
+/// `created_at` range on exactly this error.
+#[derive(Debug)]
+pub struct TooManyResults {
+    /// The cap the relay advertised in the `NEG-ERR` frame, if present (the 4th
+    /// element — e.g. `5000`).
+    pub limit: Option<u64>,
+}
+
+impl std::fmt::Display for TooManyResults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.limit {
+            Some(limit) => write!(
+                f,
+                "reconcile filter matches more than the relay's cap of {limit}"
+            ),
+            None => write!(
+                f,
+                "reconcile filter matches more than the relay's per-sync cap"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TooManyResults {}
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct Relay {
@@ -118,6 +152,16 @@ impl Relay {
                 }
                 Some("NEG-ERR") => {
                     let reason = frame.get(2).and_then(Value::as_str).unwrap_or("");
+                    // "too many query results" (strfry) / "RESULTS_TOO_BIG" (the
+                    // NIP-77 spec code) is the recoverable cap refusal — surface it
+                    // as a typed error so a windowed caller can narrow and retry,
+                    // rather than a fatal opaque string.
+                    if reason.contains("too many query results")
+                        || reason.contains("RESULTS_TOO_BIG")
+                    {
+                        let limit = frame.get(3).and_then(Value::as_u64);
+                        return Err(Box::new(TooManyResults { limit }));
+                    }
                     return Err(format!("relay refused reconciliation: {reason}").into());
                 }
                 // A relay that doesn't speak NIP-77 answers NEG-OPEN with a
