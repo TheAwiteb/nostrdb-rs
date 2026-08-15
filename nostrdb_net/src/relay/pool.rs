@@ -206,8 +206,10 @@ impl RelayPool {
             .retain(|pool_relay| !urls.contains(&pool_relay.relay.url));
     }
 
-    // standardize the format (ie, trailing slashes)
-    fn canonicalize_url(url: String) -> String {
+    /// Standardize a relay url's format (e.g. trailing slashes) the same way
+    /// [`add_url`](Self::add_url) does, so callers that key their own state by
+    /// relay url match what the pool stores and reports in [`PoolEvent`]s.
+    pub fn canonicalize_url(url: String) -> String {
         match Url::parse(&url) {
             Ok(parsed_url) => parsed_url.to_string(),
             Err(_) => url, // If parsing fails, return the original URL.

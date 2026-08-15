@@ -13,6 +13,7 @@
 //! keyed per `(kind, d-tag)`) so stale revisions aren't re-pushed forever.
 
 mod relay;
+mod session;
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +23,7 @@ use nostrdb::{Config, Filter, Ndb, Note, Transaction};
 use serde_json::json;
 
 pub use relay::{Diff, Relay};
+pub use session::Session;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

@@ -35,7 +35,7 @@ dirs = { workspace = true }
 # rustls-tls-webpki-roots provides wss:// TLS with bundled roots.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-tokio = { workspace = true, features = ["sync", "rt", "net", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "net", "macros", "time"] }
 
 # reset_sigpipe restores SIG_DFL for text-emitting CLIs built on relay_sync.
 [target.'cfg(unix)'.dependencies]
