@@ -88,6 +88,31 @@ impl std::fmt::Display for TooManyResults {
 
 impl std::error::Error for TooManyResults {}
 
+/// A *transient* reconcile/sync failure — one a retry can plausibly recover from,
+/// as opposed to a permanent refusal. It marks three cases: the relay dropped or
+/// stalled the connection mid-session, or it answered a `NEG-OPEN` with a
+/// `closed: …` NEG-ERR ("retry later"). A long-lived
+/// [`Session`](super::Session)'s backfill loop downcasts to this to decide whether
+/// to back off and try again, versus give up on a permanent error (a `blocked: …`
+/// NEG-ERR, a relay that doesn't speak NIP-77, a malformed frame). Distinct from
+/// [`TooManyResults`], which is recovered not by retrying but by windowing the
+/// filter under the relay's per-sync cap.
+///
+/// The one-shot CLI paths ([`reconcile_sync`](super::reconcile_sync),
+/// [`pull_reconcile`](super::pull_reconcile)) don't distinguish it — any reconcile
+/// error already routes them to their best-effort NIP-01 fallback — so this only
+/// changes the failure's `Display` text there, not its handling.
+#[derive(Debug)]
+pub struct Transient(pub String);
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Transient {}
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct Relay {
@@ -175,6 +200,15 @@ impl Relay {
                     {
                         let limit = frame.get(3).and_then(Value::as_u64);
                         return Err(Box::new(TooManyResults { limit }));
+                    }
+                    // A `closed: …` NEG-ERR is the relay asking us to retry later
+                    // (e.g. strfry `closed: retry later`) — a transient refusal, as
+                    // opposed to a permanent `blocked: …`. Type it so a long-lived
+                    // session's backfill can back off and retry rather than give up.
+                    if reason.split(':').next().map(str::trim) == Some("closed") {
+                        return Err(Box::new(Transient(format!(
+                            "relay closed reconciliation: {reason}"
+                        ))));
                     }
                     return Err(format!("relay refused reconciliation: {reason}").into());
                 }
@@ -295,14 +329,35 @@ impl Relay {
     /// stream never yields `None`, so the EOF guard below would never fire).
     async fn next_text(&mut self) -> Result<String> {
         loop {
+            // A stall, a clean EOF, and a mid-stream websocket error are all
+            // transient connection hiccups (the peer went away, not a permanent
+            // refusal) — type them as [`Transient`] so a session backfill retries
+            // rather than giving up on the first dropped connection.
             let msg = tokio::time::timeout(RECV_TIMEOUT, self.ws.next())
                 .await
-                .map_err(|_| format!("{} stalled waiting for a frame", self.url))?
-                .ok_or_else(|| format!("{} closed the connection", self.url))??;
+                .map_err(|_| Transient(format!("{} stalled waiting for a frame", self.url)))?
+                .ok_or_else(|| Transient(format!("{} closed the connection", self.url)))?
+                .map_err(|e| Transient(format!("{}: websocket read error: {e}", self.url)))?;
             if let Message::Text(text) = msg {
                 return Ok(text);
             }
         }
+    }
+
+    /// Send a `NEG-CLOSE` for the reconcile subscription, telling the relay to drop
+    /// any negentropy session it is still tracking for us.
+    ///
+    /// [`reconcile`](Self::reconcile) already emits this on a *successful* pass; this
+    /// is the cancel path — a long-lived session whose backfill is torn down
+    /// mid-reconcile (an account switch, a dropped subscription) calls it so the
+    /// relay doesn't keep a half-open negentropy session around until it times out.
+    /// Cheap and best-effort: sending it when no session is open (or to a relay that
+    /// already forgot one) is a harmless no-op per NIP-77.
+    pub async fn close_negentropy(&mut self) -> Result<()> {
+        self.ws
+            .send(Message::Text(format!(r#"["NEG-CLOSE","{SUB}"]"#)))
+            .await?;
+        Ok(())
     }
 }
 

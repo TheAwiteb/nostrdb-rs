@@ -48,11 +48,24 @@ use nostrdb::{Filter, Ndb, SendFilter};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::interval;
 
-use super::{Relay, pull_reconcile_windowed};
+use super::{Relay, Transient, pull_reconcile_windowed};
 use crate::{ClientMessage, RelayPool, RelayStatus, WsEvent, WsMessage};
 
 /// How often the loop pings/reconnects relays to keep the pool alive.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many times a history backfill re-attempts a connect + reconcile after a
+/// transient failure (a dropped/stalled connection, a `closed: …` NEG-ERR) before
+/// giving up. Bounded so a *permanently* failing transient error can't spin the
+/// task forever; on exhaustion the backfill settles (having synced what it could),
+/// and the next (re)declaration — app restart, account switch, private-relay
+/// change — starts a fresh set of attempts.
+const BACKFILL_MAX_ATTEMPTS: u32 = 5;
+
+/// Base backoff before the first backfill retry; each subsequent attempt doubles
+/// it (200ms, 400ms, 800ms, 1.6s). Short, because a private relay is usually the
+/// user's own and a transient hiccup clears quickly.
+const BACKFILL_RETRY_BASE: Duration = Duration::from_millis(200);
 
 /// Upper bound for a history backfill's initial `created_at` window: `u32::MAX`
 /// (unix second `4294967295` ≈ year 2106).
@@ -236,6 +249,23 @@ struct LoopState {
     /// Count of backfills spawned so far, snapshotted by a `WaitForSync` barrier
     /// as its settle target (against `progress.done`).
     started: u64,
+    /// Cancel handles for in-flight backfill tasks, keyed by subscription id +
+    /// relay url. Dropping a sender cancels its task — which, if a reconcile is in
+    /// flight, emits a `NEG-CLOSE` before stopping (see [`backfill`]). Re-declaring a
+    /// given `(id, url)` cancels the prior task there; dropping a subscription
+    /// cancels every task under that id across all relays.
+    backfills: HashMap<BackfillKey, oneshot::Sender<()>>,
+}
+
+/// Identifies one in-flight backfill task: a subscription's history reconcile
+/// against a single relay. A logical subscription can span several relays (one
+/// [`Session::set_subscription`] call per url under the same id), each with its own
+/// backfill, so the relay url is part of the key — re-declaring one relay's leg
+/// must not cancel a sibling relay's fresh backfill from the same declaration.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BackfillKey {
+    id: String,
+    url: String,
 }
 
 /// The background relay loop: owns the [`RelayPool`], ingests inbound events into
@@ -321,24 +351,39 @@ fn apply_cmd(
                 .desired
                 .entry(url.clone())
                 .or_default()
-                .insert(id, live);
+                .insert(id.clone(), live);
             // NIP-77 negentropy history backfill, off the loop on its own task.
             // Track its completion (via a drop guard so a panic still counts) so a
             // `WaitForSync` barrier can observe when history has settled.
             if !history.is_empty() {
+                let key = BackfillKey {
+                    id,
+                    url: url.clone(),
+                };
+                // Cancel any prior backfill for this exact (id, url) so a
+                // re-declaration replaces it rather than racing a duplicate
+                // reconcile (and a duplicate NEG-OPEN) against the same relay.
+                state.backfills.remove(&key);
                 state.started += 1;
                 let ndb = ndb.clone();
                 let progress = state.progress.clone();
+                let (cancel_tx, cancel_rx) = oneshot::channel();
                 tokio::spawn(async move {
                     let _guard = BackfillDoneGuard(progress);
-                    backfill(ndb, url, history).await;
+                    backfill(ndb, url, history, cancel_rx).await;
                 });
+                state.backfills.insert(key, cancel_tx);
             }
         }
         Cmd::DropSubscription(id) => {
             for subs in state.desired.values_mut() {
                 subs.remove(&id);
             }
+            // Cancel every in-flight backfill under this id (across all relays).
+            // Dropping each sender fires its task's cancel, which emits a NEG-CLOSE
+            // if a reconcile was still in flight, so the relay stops tracking the
+            // negentropy session instead of leaving it half-open until it times out.
+            state.backfills.retain(|key, _| key.id != id);
             state.pool.unsubscribe(id);
         }
         Cmd::Publish { note_json, relays } => {
@@ -397,38 +442,141 @@ fn relay_connected(pool: &RelayPool, url: &str) -> bool {
         .any(|r| r.relay.url == url && matches!(r.relay.status, RelayStatus::Connected))
 }
 
-/// Pull history for a subscription from `url` using NIP-77 negentropy.
+/// Pull history for a subscription from `url` using NIP-77 negentropy, retrying a
+/// transient failure with backoff and stopping promptly on `cancel`.
 ///
-/// Opens a dedicated reconcile connection (separate from the live pool) and, for
-/// each history filter, reconciles the relay against the local db and fetches the
-/// ids the relay holds that we lack — via [`pull_reconcile_windowed`], so a filter
-/// matching more events than the relay's per-sync cap still syncs (it bisects the
-/// `created_at` range under the cap). See the [module docs](self) for why each
-/// filter is reduced to its wire JSON synchronously before awaiting.
-async fn backfill(ndb: Ndb, url: String, filters: Vec<SendFilter>) {
-    let mut relay = match Relay::connect(&url).await {
-        Ok(relay) => relay,
-        Err(e) => {
-            tracing::warn!("session backfill: connect {url} failed: {e}");
+/// Each attempt opens a dedicated reconcile connection (separate from the live
+/// pool) and, for each history filter, reconciles the relay against the local db
+/// and fetches the ids the relay holds that we lack — via [`pull_reconcile_windowed`],
+/// so a filter matching more events than the relay's per-sync cap still syncs (it
+/// bisects the `created_at` range under the cap).
+///
+/// A transient interruption — a dropped/stalled connection or a `closed: …`
+/// NEG-ERR ([`Transient`]) — retries the whole pass after a backoff, up to
+/// [`BACKFILL_MAX_ATTEMPTS`], so a private relay's momentary hiccup doesn't strand
+/// the account's history until the next (re)declaration. A permanent failure (a
+/// `blocked: …` NEG-ERR, a non-NIP-77 relay) is logged and *not* retried, since a
+/// retry can't fix it.
+///
+/// `cancel` fires when the loop tears this backfill down (a dropped subscription or
+/// a re-declaration). When it fires mid-reconcile the task emits a `NEG-CLOSE` on
+/// its connection before returning, so the relay stops tracking the negentropy
+/// session rather than leaving it half-open until it times out.
+async fn backfill(
+    ndb: Ndb,
+    url: String,
+    filters: Vec<SendFilter>,
+    mut cancel: oneshot::Receiver<()>,
+) {
+    // Reduce every filter to its wire JSON once, up front and synchronously: the
+    // transient `nostrdb::Filter` from `as_filter()` (`!Send`) drops inside the
+    // closure, so it never crosses an await, and the resulting `Vec<String>` is
+    // `Send` — letting `backfill_once` iterate it across awaits without pinning a
+    // `!Send` `SendFilter` (or its `!Send` slice iterator) into the future.
+    let filter_jsons: Vec<String> = filters
+        .iter()
+        .filter_map(|f| f.as_filter().json().ok())
+        .collect();
+
+    for attempt in 1..=BACKFILL_MAX_ATTEMPTS {
+        match backfill_once(&ndb, &url, &filter_jsons, &mut cancel).await {
+            BackfillOutcome::Done | BackfillOutcome::Cancelled => return,
+            BackfillOutcome::Retry => {}
+        }
+        if attempt == BACKFILL_MAX_ATTEMPTS {
+            tracing::warn!("session backfill: {url}: giving up after {attempt} attempts");
             return;
         }
-    };
-
-    // Reduce each filter to its wire JSON *synchronously* — the transient
-    // `nostrdb::Filter` from `as_filter()` drops at the `;`, so it never crosses an
-    // await — then hand the JSON to `pull_reconcile_windowed`, whose future stays
-    // `Send` precisely because it holds no `Filter` (an owned `SendFilter` would be
-    // `Send`, but a `&SendFilter` would need `SendFilter: Sync`, which it isn't).
-    for filter in filters {
-        let Ok(filter_json) = filter.as_filter().json() else {
-            continue;
-        };
-        if let Err(e) =
-            pull_reconcile_windowed(&mut relay, &ndb, &filter_json, BACKFILL_UNTIL).await
-        {
-            tracing::warn!("session backfill: {url}: {e}");
+        // Back off before the next attempt, but abandon the wait at once if the
+        // backfill is cancelled meanwhile.
+        let delay = BACKFILL_RETRY_BASE * 2u32.pow(attempt - 1);
+        tokio::select! {
+            biased;
+            _ = &mut cancel => return,
+            _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// The result of one [`backfill_once`] pass, telling [`backfill`] what to do next.
+enum BackfillOutcome {
+    /// Every filter reconciled (or failed permanently and was skipped). Stop.
+    Done,
+    /// A transient failure interrupted the pass; retry the whole thing after a
+    /// backoff.
+    Retry,
+    /// `cancel` fired; the task has emitted any needed `NEG-CLOSE` and should stop.
+    Cancelled,
+}
+
+/// One connect + reconcile pass over every history filter, interruptible by
+/// `cancel`.
+///
+/// Returns [`Retry`](BackfillOutcome::Retry) on a transient interruption (a failed
+/// connect, a dropped/stalled connection, a `closed: …` NEG-ERR), so
+/// [`backfill`] backs off and tries the whole pass again. A *permanent* per-filter
+/// failure is logged and skipped rather than aborting the pass — a retry can't fix
+/// it, and it must not stop the other filters — so the pass still ends
+/// [`Done`](BackfillOutcome::Done). On `cancel` mid-reconcile it emits a
+/// `NEG-CLOSE` and returns [`Cancelled`](BackfillOutcome::Cancelled).
+///
+/// `filter_jsons` are the history filters already reduced to their wire JSON by
+/// [`backfill`] (see there for why that reduction happens up front). Every error
+/// `Box` (`!Send`) is classified synchronously before the next await, keeping this
+/// future `Send` so it can run on the multi-thread runtime.
+async fn backfill_once(
+    ndb: &Ndb,
+    url: &str,
+    filter_jsons: &[String],
+    cancel: &mut oneshot::Receiver<()>,
+) -> BackfillOutcome {
+    let mut relay = tokio::select! {
+        biased;
+        _ = &mut *cancel => return BackfillOutcome::Cancelled,
+        connected = Relay::connect(url) => match connected {
+            Ok(relay) => relay,
+            Err(e) => {
+                // A failed connect is transient — the relay may just be momentarily
+                // down; retry after backoff.
+                tracing::warn!("session backfill: connect {url} failed: {e}");
+                return BackfillOutcome::Retry;
+            }
+        },
+    };
+
+    for filter_json in filter_jsons {
+        // Race the reconcile against cancellation. The cancel arm returns only a
+        // flag (it must not touch `relay`, which the reconcile arm borrows); the
+        // NEG-CLOSE is sent *after* the select, once that borrow is released.
+        let cancelled = tokio::select! {
+            biased;
+            _ = &mut *cancel => true,
+            result = pull_reconcile_windowed(&mut relay, ndb, filter_json, BACKFILL_UNTIL) => {
+                if let Err(e) = result {
+                    // Classify synchronously (the error `Box` is `!Send`) before the
+                    // next await: a transient error retries the whole pass, a
+                    // permanent one is logged and this filter skipped.
+                    if is_transient(&*e) {
+                        tracing::warn!("session backfill: {url}: {e} (retrying)");
+                        return BackfillOutcome::Retry;
+                    }
+                    tracing::warn!("session backfill: {url}: {e}");
+                }
+                false
+            }
+        };
+        if cancelled {
+            let _ = relay.close_negentropy().await;
+            return BackfillOutcome::Cancelled;
+        }
+    }
+    BackfillOutcome::Done
+}
+
+/// Whether a backfill error is a transient connection/relay hiccup worth retrying,
+/// versus a permanent refusal a retry can't fix. See [`Transient`].
+fn is_transient(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<Transient>().is_some()
 }
 
 #[cfg(test)]
@@ -639,10 +787,14 @@ mod tests {
     /// The settle barrier resolves when the backfill *task finishes*, and the
     /// [`BackfillDoneGuard`] drop-guard counts a task that errored (or panicked)
     /// as done too — so a backfill against an unreachable relay still settles,
-    /// having synced nothing. This pins the current settle-on-failure semantics:
-    /// a settle is *not* proof of a complete history, only that the attempt
-    /// finished. A future success/failure distinction (retry-on-failure) should
-    /// update this test deliberately.
+    /// having synced nothing. This pins the settle-on-exhaustion semantics: a
+    /// settle is *not* proof of a complete history, only that the attempt (now:
+    /// every retry) finished.
+    ///
+    /// A failed connect is transient, so [`backfill`] retries it
+    /// [`BACKFILL_MAX_ATTEMPTS`] times with backoff before giving up — the settle
+    /// therefore lands only after the retries are exhausted, still well within the
+    /// generous timeout below, and still having synced nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_sync_settles_even_when_backfill_fails() {
         let (_b_dir, ndb_b) = temp_ndb();

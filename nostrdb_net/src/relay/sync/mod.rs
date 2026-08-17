@@ -22,7 +22,7 @@ use negentropy::{Id, NegentropyStorageVector};
 use nostrdb::{Config, Filter, Ndb, Note, Transaction};
 use serde_json::json;
 
-pub use relay::{Diff, Relay, TooManyResults};
+pub use relay::{Diff, Relay, TooManyResults, Transient};
 pub use session::Session;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
