@@ -484,6 +484,20 @@ mod tests {
         format!(r#"["EVENT",{note_json}]"#)
     }
 
+    /// Ingest `n` distinct signed events of `kind` directly into `ndb` (used to
+    /// stock a relay's store before a client reconciles it). Distinct content
+    /// gives distinct ids. Returns the ids in creation order.
+    fn seed_events(ndb: &Ndb, kind: u32, n: usize) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| {
+                let (json, id) = signed_note(kind, &format!("seed-{i}"));
+                ndb.process_client_event(&event_frame(&json))
+                    .expect("ingest seed");
+                id
+            })
+            .collect()
+    }
+
     /// Wait until note `id` (of `kind`) is queryable in `ndb`, driven by a
     /// [`SubscriptionStream`] with a backstop `timeout`. Subscribes first, then
     /// checks presence and awaits ingests, so it catches a note whether it landed
@@ -552,6 +566,101 @@ mod tests {
             "B should backfill the event from the relay"
         );
         relay.shutdown();
+    }
+
+    /// `wait_for_sync` resolves only once the backfilled history is actually
+    /// queryable: a plain *synchronous* count the instant it returns already sees
+    /// the whole seeded set (settle = readable, not a timer), and the count
+    /// matches what the relay held. The live filter is over an unrelated kind so
+    /// it cannot match — only the negentropy backfill leg can deliver the events.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_sync_settles_with_whole_history_queryable() {
+        const SEEDED: usize = 12;
+        let (_relay_dir, relay_ndb) = temp_ndb();
+        let relay = spawn_relay(relay_ndb.clone());
+        let url = relay.url();
+
+        let ids = seed_events(&relay_ndb, KIND, SEEDED);
+        let last = *ids.last().expect("seeded ids");
+        assert!(
+            await_note(&relay_ndb, last, KIND as u64, Duration::from_secs(5)).await,
+            "relay should index all seeded events before B reconciles"
+        );
+
+        // B subscribes with a live filter that can't match (different kind) and a
+        // history filter that can, so an arrival proves the backfill, not replay.
+        let (_b_dir, ndb_b) = temp_ndb();
+        let session_b = Session::new(ndb_b.clone());
+        let live_none = Filter::new().kinds([UNRELATED_KIND as u64]).build();
+        let history = Filter::new().kinds([KIND as u64]).build();
+        session_b.set_subscription("hist", url.clone(), vec![live_none], vec![history]);
+
+        tokio::time::timeout(Duration::from_secs(10), session_b.wait_for_sync())
+            .await
+            .expect("backfill should settle within the bound");
+
+        // The instant settle resolves, every event is queryable — no extra wait.
+        assert_eq!(
+            count_kind(&ndb_b, KIND as u64),
+            SEEDED,
+            "settle must mean the whole reconciled history is readable"
+        );
+        relay.shutdown();
+    }
+
+    /// With no history filter there is nothing to backfill, so the barrier
+    /// snapshots a target of zero and `wait_for_sync` returns immediately rather
+    /// than blocking on a sync. Covers both a live-only subscription and a
+    /// session that never subscribed at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_sync_returns_immediately_without_history() {
+        let (_relay_dir, relay_ndb) = temp_ndb();
+        let relay = spawn_relay(relay_ndb.clone());
+        let url = relay.url();
+
+        // Live-only subscription: no backfill task is ever started.
+        let (_b_dir, ndb_b) = temp_ndb();
+        let session = Session::new(ndb_b);
+        let live = Filter::new().kinds([KIND as u64]).build();
+        session.set_subscription("live", url, vec![live], vec![]);
+        tokio::time::timeout(Duration::from_secs(2), session.wait_for_sync())
+            .await
+            .expect("live-only settle must not block on a backfill");
+
+        // A session that never subscribed also settles at once.
+        let (_c_dir, ndb_c) = temp_ndb();
+        let fresh = Session::new(ndb_c);
+        tokio::time::timeout(Duration::from_secs(2), fresh.wait_for_sync())
+            .await
+            .expect("un-subscribed settle must not block");
+        relay.shutdown();
+    }
+
+    /// The settle barrier resolves when the backfill *task finishes*, and the
+    /// [`BackfillDoneGuard`] drop-guard counts a task that errored (or panicked)
+    /// as done too — so a backfill against an unreachable relay still settles,
+    /// having synced nothing. This pins the current settle-on-failure semantics:
+    /// a settle is *not* proof of a complete history, only that the attempt
+    /// finished. A future success/failure distinction (retry-on-failure) should
+    /// update this test deliberately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_sync_settles_even_when_backfill_fails() {
+        let (_b_dir, ndb_b) = temp_ndb();
+        let session = Session::new(ndb_b.clone());
+        // Nothing listens on port 1, so the backfill's connect is refused fast.
+        let dead = "ws://127.0.0.1:1".to_string();
+        let live = Filter::new().kinds([UNRELATED_KIND as u64]).build();
+        let history = Filter::new().kinds([KIND as u64]).build();
+        session.set_subscription("dead", dead, vec![live], vec![history]);
+
+        tokio::time::timeout(Duration::from_secs(10), session.wait_for_sync())
+            .await
+            .expect("settle must resolve even when the backfill fails");
+        assert_eq!(
+            count_kind(&ndb_b, KIND as u64),
+            0,
+            "a failed backfill syncs nothing"
+        );
     }
 
     /// A [`Session`]'s live `REQ` delivers an event published *after* it
