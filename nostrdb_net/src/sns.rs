@@ -20,8 +20,8 @@
 //!   team_keypair   = derive_secp256k1_keypair(team_root)
 //!   team_nip44_key = hkdf_extract(ikm=team_root, salt="nip44-v2")
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use hkdf::Hkdf;
 use nostr::key::PublicKey;
 use nostr::nips::nip19::FromBech32;
@@ -260,10 +260,10 @@ pub fn parse_keyshare(note: &Note) -> Option<KeyShare> {
 /// Tries hex first (the canonical form the SNS builders emit), then a bech32
 /// secret key (e.g. `nsec…`) so a human-pasted share still resolves.
 fn parse_team_root(s: &str) -> Option<[u8; 32]> {
-    if let Ok(bytes) = hex::decode(s) {
-        if let Ok(root) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            return Some(root);
-        }
+    if let Ok(bytes) = hex::decode(s)
+        && let Ok(root) = <[u8; 32]>::try_from(bytes.as_slice())
+    {
+        return Some(root);
     }
     crate::SecretKey::from_bech32(s)
         .ok()
@@ -332,8 +332,15 @@ mod tests {
         let board =
             "30619:d6623502bcf67f6758e25080111ad9221181c33cfcba14d74dc9e3784ecfe1f7:headway";
 
-        let giftwrap = wrap_keyshare(&sender, &recipient.pubkey, &test_root(), board, Some(2), 100)
-            .expect("giftwrap");
+        let giftwrap = wrap_keyshare(
+            &sender,
+            &recipient.pubkey,
+            &test_root(),
+            board,
+            Some(2),
+            100,
+        )
+        .expect("giftwrap");
         assert_eq!(giftwrap.kind(), 1059);
         // Outer author is a throwaway ephemeral key, never the sharer.
         assert_ne!(giftwrap.pubkey(), sender.pubkey.bytes());

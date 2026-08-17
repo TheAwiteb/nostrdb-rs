@@ -14,9 +14,9 @@
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
-use tokio_tungstenite::tungstenite::Message as TMessage;
 
 /// A websocket data frame exchanged with a relay.
 #[derive(Clone, Debug, Eq, PartialEq)]

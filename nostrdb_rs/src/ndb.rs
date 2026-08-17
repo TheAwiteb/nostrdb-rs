@@ -894,7 +894,7 @@ impl Ndb {
             bindings::ndb_compact(
                 self.as_ptr(),
                 c_output.as_ptr(),
-                own_pubkeys.as_ptr() as *const [u8; 32],
+                own_pubkeys.as_ptr(),
                 own_pubkeys.len() as c_int,
             )
         };

@@ -9,8 +9,8 @@
 //!   pns_keypair  = derive_secp256k1_keypair(pns_key)
 //!   pns_nip44_key = hkdf_extract(ikm=pns_key, salt="nip44-v2")
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use hkdf::Hkdf;
 use nostr::nips::nip44::v2::{self, ConversationKey};
 use nostrdb::{Note, NoteBuilder};

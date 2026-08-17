@@ -48,7 +48,7 @@ impl PartialEq for Relay {
     }
 }
 
-impl Eq for Relay { }
+impl Eq for Relay {}
 
 impl Relay {
     pub fn new(url: String, wakeup: impl Fn() + Send + Sync + 'static) -> Result<Self> {
