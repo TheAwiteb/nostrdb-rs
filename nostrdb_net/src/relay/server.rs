@@ -22,6 +22,8 @@
 //! There is deliberately no NIP-11 or NIP-42 auth. Access control is "bind to
 //! localhost" — this is a dogfooding port, not a public relay.
 //!
+//! Rumors are never served. See [`is_servable`].
+//!
 //! [NIP-01]: https://github.com/nostr-protocol/nips/blob/master/01.md
 //! [NIP-77]: https://github.com/nostr-protocol/nips/blob/master/77.md
 
@@ -30,7 +32,7 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
-use nostrdb::{Filter, Ndb, SubscriptionStream, Transaction};
+use nostrdb::{Filter, Ndb, Note, SubscriptionStream, Transaction};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -233,6 +235,29 @@ fn handle_event(text: &str, frame: &[Value], ndb: &Ndb, out_tx: &mpsc::Unbounded
     }
 }
 
+/// Whether a stored note may be handed to a client.
+///
+/// Rumors may not. A rumor is the decrypted inner event of a gift-wrap or SNS
+/// envelope: nostrdb peels it on ingest and stores it alongside ordinary notes,
+/// so it matches an ordinary filter, but it is private content that only the
+/// receiving account was ever meant to read. Serving one leaks it to anything
+/// that can open a `REQ`.
+///
+/// It also cannot survive the trip. A rumor carries no signature — nostrdb
+/// reuses the 64-byte `sig` field to hold the receiver pubkey and giftwrap id —
+/// so a client that re-ingests one fails signature validation and drops it.
+/// Before this filter that became a permanent stall rather than a visible
+/// error: the negentropy reconcile advertised rumor ids, the client asked for
+/// them, stored none of them, then waited out its whole ingest timeout for
+/// events that could never land — on *every* run.
+///
+/// Withholding the rumor costs a legitimate peer nothing: it is reproducible
+/// from the envelope it arrived in by any client holding the key, and that
+/// envelope is an ordinary signed event which is still served normally.
+fn is_servable(note: &Note<'_>) -> bool {
+    !note.is_rumor()
+}
+
 fn handle_req(
     frame: &[Value],
     ndb: &Ndb,
@@ -257,6 +282,9 @@ fn handle_req(
         && let Ok(results) = ndb.query(&txn, &filters, STORED_QUERY_LIMIT)
     {
         for result in results {
+            if !is_servable(&result.note) {
+                continue;
+            }
             if let Ok(note_json) = result.note.json()
                 && out_tx.send(event(&sub_id, &note_json)).is_err()
             {
@@ -312,6 +340,7 @@ async fn stream_subscription(
                 let Ok(txn) = Transaction::new(&ndb) else { break };
                 for key in keys {
                     if let Ok(note) = ndb.get_note_by_key(&txn, key)
+                        && is_servable(&note)
                         && let Ok(note_json) = note.json()
                         && out_tx.send(event(&sub_id, &note_json)).is_err()
                     {
@@ -412,6 +441,11 @@ fn build_neg_session(ndb: &Ndb, filter: Filter) -> Result<NegSession, BoxError> 
 
     let mut storage = NegentropyStorageVector::with_capacity(results.len());
     for result in results {
+        // Must match what a `REQ` will actually serve. An id advertised here but
+        // withheld there is one the client asks for and never receives.
+        if !is_servable(&result.note) {
+            continue;
+        }
         storage.insert(
             result.note.created_at(),
             Id::from_byte_array(*result.note.id()),
@@ -448,4 +482,117 @@ fn notice(message: &str) -> Message {
 /// it in rather than parse-and-reserialize.
 fn event(sub_id: &str, note_json: &str) -> Message {
     Message::Text(format!(r#"["EVENT",{},{}]"#, json!(sub_id), note_json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FullKeypair;
+    use crate::sns::{derive_sns_keys, wrap_rumor};
+    use nostrdb::{Config, NoteBuilder};
+
+    fn test_root() -> [u8; 32] {
+        let mut root = [0u8; 32];
+        root[0] = 0x11;
+        root[31] = 0x22;
+        root
+    }
+
+    /// `REQ` the given filter and collect the ids the relay replays before `EOSE`.
+    async fn req_ids(url: &str, filter: Value) -> Vec<String> {
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+        ws.send(Message::Text(json!(["REQ", "s", filter]).to_string()))
+            .await
+            .expect("send REQ");
+        let mut ids = Vec::new();
+        loop {
+            let msg = ws.next().await.expect("frame").expect("ok");
+            let Message::Text(text) = msg else { continue };
+            let frame: Vec<Value> = serde_json::from_str(&text).expect("json");
+            match frame.first().and_then(Value::as_str) {
+                Some("EVENT") => {
+                    let id = frame[2]["id"].as_str().expect("id").to_owned();
+                    ids.push(id);
+                }
+                Some("EOSE") => break,
+                _ => {}
+            }
+        }
+        ids
+    }
+
+    /// A peeled SNS rumor must never leave the relay.
+    ///
+    /// It is private content, and it carries no signature (nostrdb reuses `sig`
+    /// for the receiver pubkey + giftwrap id), so a client that received one
+    /// could not store it anyway — it would fail validation and the client would
+    /// wait out its whole ingest timeout for an event that can never land. The
+    /// envelope the rumor arrived in is an ordinary signed event and is still
+    /// served, so a legitimate peer loses nothing.
+    #[tokio::test]
+    async fn rumors_are_not_served() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ndb = Ndb::new(dir.path().to_str().unwrap(), &Config::new()).expect("ndb");
+
+        let member = FullKeypair::generate();
+        let keys = derive_sns_keys(&test_root()).expect("keys");
+        assert!(ndb.add_team_root(&test_root()));
+
+        // Seal a kind-1 note into an SNS envelope; nostrdb peels it on ingest, so
+        // the rumor lands in the db beside the kind-1081 envelope itself.
+        let inner = NoteBuilder::new()
+            .kind(1)
+            .content("private board edit")
+            .created_at(1700000000)
+            .sign(&member.secret_key.secret_bytes())
+            .build()
+            .expect("note");
+        let inner_json = inner.json().expect("inner json");
+        let envelope = wrap_rumor(&keys, &member, &inner_json, 1700000000).expect("envelope");
+        let envelope_json = envelope.json().expect("envelope json");
+        let envelope_id = hex::encode(envelope.id());
+
+        let sub = ndb
+            .subscribe(&[Filter::new().kinds(vec![1]).build()])
+            .expect("sub");
+        let waiter = ndb.wait_for_all_notes(sub, 1);
+        ndb.process_event(&format!("[\"EVENT\",\"e\",{envelope_json}]"))
+            .expect("ingest envelope");
+        waiter.await.expect("rumor ingested");
+
+        // The rumor really is in the db, and really is flagged as one.
+        let rumor_id = {
+            let txn = Transaction::new(&ndb).expect("txn");
+            let stored = ndb
+                .query(&txn, &[Filter::new().kinds(vec![1]).build()], 8)
+                .expect("query");
+            assert_eq!(stored.len(), 1, "the peeled rumor should be stored");
+            assert!(stored[0].note.is_rumor(), "stored note should be a rumor");
+            hex::encode(stored[0].note.id())
+        };
+
+        let relay = spawn(ndb.clone(), "127.0.0.1:0".parse().expect("addr")).expect("spawn");
+        let url = relay.url();
+
+        // The rumor is withheld...
+        let served = req_ids(&url, json!({ "kinds": [1] })).await;
+        assert!(
+            served.is_empty(),
+            "relay served a rumor: {served:?} (rumor id {rumor_id})"
+        );
+
+        // ...even when asked for by id, which is how the stalling client asked.
+        let by_id = req_ids(&url, json!({ "ids": [rumor_id] })).await;
+        assert!(by_id.is_empty(), "relay served a rumor asked for by id");
+
+        // ...but the signed envelope it arrived in is still served normally.
+        let envelopes = req_ids(&url, json!({ "kinds": [1081] })).await;
+        assert_eq!(
+            envelopes,
+            vec![envelope_id],
+            "the SNS envelope should still be served"
+        );
+    }
 }
